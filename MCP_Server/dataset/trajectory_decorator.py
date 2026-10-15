@@ -74,6 +74,10 @@ _AUDIO_EXTS = frozenset({
     ".wav", ".aiff", ".aif", ".flac", ".mp3", ".ogg", ".m4a", ".wma", ".alc", ".asd",
 })
 
+# Params the user types as prose. They can contain anything a chat message can,
+# so they get the same email/path scrub the intent text gets.
+_FREE_TEXT_KEYS = frozenset({"text", "note", "search_query"})
+
 
 def _light_snapshots() -> bool:
     flag = os.environ.get("ABLETON_MCP_DATASET_LIGHT", "").strip().lower()
@@ -185,6 +189,13 @@ def _extract_params(kwargs: dict) -> dict[str, Any]:
             from .snapshot import _scrub_name
 
             params[key] = _scrub_name(value)
+            continue
+        if key in _FREE_TEXT_KEYS and isinstance(value, str):
+            from .recorder import scrub_text
+
+            cleaned = scrub_text(value, 500)
+            if cleaned is not None:
+                params[key] = cleaned
             continue
         if isinstance(value, str) and len(value) > 500:
             value = value[:500] + "..."
@@ -422,30 +433,33 @@ def trajectory_tool(tool_name: str, modifying: bool | None = None):
         return True, None
 
     def decorator(func: Callable) -> Callable:
+        func_is_async = inspect.iscoroutinefunction(func)
+
+        async def _call(*args, **kwargs) -> Any:
+            """Invoke the wrapped tool, awaiting only if it is actually async.
+
+            Sync tool bodies run inline here, exactly as before. FastMCP calls
+            sync tools directly inside the event loop coroutine, so this is the
+            same thread and the same blocking behaviour — wrapping them in an
+            async wrapper changes nothing about how they execute.
+            """
+            if func_is_async:
+                return await func(*args, **kwargs)
+            return func(*args, **kwargs)
+
+        # Always async, even around a sync tool. ctx.elicit is a coroutine, and
+        # a sync wrapper has no way to await it: FastMCP runs sync tools inside
+        # the running loop, so there is no loop to schedule on and no separate
+        # thread to hand off to. Since every tool in this server is sync, a
+        # sync wrapper meant the client dialog could never be shown at all and
+        # consent silently fell back to the text notice. functools.wraps keeps
+        # the signature, so FastMCP still injects ctx and derives the same
+        # schema (ctx excluded) — being async is invisible to the client.
         @functools.wraps(func)
-        def sync_wrapper(*args, **kwargs) -> Any:
+        async def wrapper(*args, **kwargs) -> Any:
             recorder = _safe_get_recorder()
             if recorder is None:
-                return _with_consent_notice(func(*args, **kwargs))
-
-            pre_hash, pre_hash_source, start = _begin(recorder, kwargs)
-            success, error = False, None
-            try:
-                result = func(*args, **kwargs)
-                success, error = _classify(result)
-                return result
-            except Exception as e:
-                error = str(e)
-                raise
-            finally:
-                _finish(recorder, kwargs, pre_hash, pre_hash_source,
-                        start, success, error)
-
-        @functools.wraps(func)
-        async def async_wrapper(*args, **kwargs) -> Any:
-            recorder = _safe_get_recorder()
-            if recorder is None:
-                result = await func(*args, **kwargs)
+                result = await _call(*args, **kwargs)
                 # Prefer a real client dialog; fall back to the text prompt
                 if await _try_elicit(kwargs):
                     recorder = _safe_get_recorder()
@@ -456,7 +470,7 @@ def trajectory_tool(tool_name: str, modifying: bool | None = None):
             pre_hash, pre_hash_source, start = _begin(recorder, kwargs)
             success, error = False, None
             try:
-                result = await func(*args, **kwargs)
+                result = await _call(*args, **kwargs)
                 success, error = _classify(result)
                 return result
             except Exception as e:
@@ -466,8 +480,6 @@ def trajectory_tool(tool_name: str, modifying: bool | None = None):
                 _finish(recorder, kwargs, pre_hash, pre_hash_source,
                         start, success, error)
 
-        if inspect.iscoroutinefunction(func):
-            return async_wrapper
-        return sync_wrapper
+        return wrapper
 
     return decorator

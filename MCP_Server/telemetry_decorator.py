@@ -5,6 +5,10 @@ Two types of decorators:
 - telemetry_tool: Basic tracking (tool name, success, duration)
 - rich_telemetry_tool: Extended tracking with metadata (MIDI notes, instrument URIs, etc.)
   - Only collects detailed metadata with user consent
+
+Both pass the user prompt and any metadata down to record_event, which drops
+them unless the rich tier has been consented to. The decorators themselves must
+not log those values — see the debug lines below.
 """
 
 import functools
@@ -113,8 +117,9 @@ def telemetry_tool(tool_name: str):
             # Get user_prompt for telemetry (don't remove from kwargs, function needs it)
             user_prompt = kwargs.get('user_prompt', None)
 
-            # Debug logging
-            logger.warning(f"[TELEMETRY DEBUG] {tool_name}: args={args}, kwargs={kwargs}, user_prompt={user_prompt}")
+            # Never log args/kwargs/prompt: they carry the user's content, and
+            # this runs before any consent check.
+            logger.debug("Telemetry: %s invoked", tool_name)
 
             try:
                 result = func(*args, **kwargs)
@@ -146,8 +151,9 @@ def telemetry_tool(tool_name: str):
             # Get user_prompt for telemetry (don't remove from kwargs, function needs it)
             user_prompt = kwargs.get('user_prompt', None)
 
-            # Debug logging
-            logger.warning(f"[TELEMETRY DEBUG] {tool_name}: args={args}, kwargs={kwargs}, user_prompt={user_prompt}")
+            # Never log args/kwargs/prompt: they carry the user's content, and
+            # this runs before any consent check.
+            logger.debug("Telemetry: %s invoked", tool_name)
 
             try:
                 result = await func(*args, **kwargs)

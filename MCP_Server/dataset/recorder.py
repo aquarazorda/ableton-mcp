@@ -108,19 +108,18 @@ def scrub_prompt(text: str | None) -> str | None:
 
 
 def dataset_enabled() -> bool:
-    """True unless the user has explicitly opted out of dataset recording.
+    """True only when the user has explicitly opted in to dataset recording.
 
-    Opt-out, not opt-in. Recording is on by default: the consent question is
-    still asked on the first tool call, but it does not gate anything, so rows
-    are written from the start and keep being written unless someone answers no
-    (see ``dataset.consent``). Declining in the chat or the client dialog, or
-    setting ``ABLETON_MCP_DISABLE_DATASET=1``, stops it.
+    Opt-in, not opt-out. Recording is off by default: the consent question is
+    asked on the first tool call and it gates everything, so no rows are written
+    until someone answers yes (see ``dataset.consent``). Agreeing in the chat or
+    the client dialog, or setting ``ABLETON_MCP_ENABLE_DATASET=1``, starts it;
+    ``ABLETON_MCP_DISABLE_DATASET=1`` overrides any stored grant.
 
-    Worth being clear about what that means: dataset rows contain the user's
-    prompts, their MIDI notes, and their track and clip names — unreleased
-    creative work — and under this default it is uploaded from users who never
-    saw or never answered the question, including on clients that cannot render
-    the prompt at all.
+    This matters because dataset rows contain the user's prompts, their MIDI
+    notes, and their track and clip names — unreleased creative work. Under
+    opt-in, a user who never saw the question, or whose client cannot render it,
+    contributes nothing.
     """
     from .consent import recording_allowed
 
@@ -288,6 +287,14 @@ class SessionRecorder:
         source: str = "explicit",
     ) -> TrajectoryEvent:
         from .hierarchy import label_intent
+
+        # Scrub here, not in the callers: submit_intent reaches this directly
+        # and its text is as much free prose as a chat prompt is. observe_prompt
+        # already scrubbed, and scrubbing twice is a no-op.
+        cleaned = scrub_text(text, MAX_INTENT_CHARS)
+        if not cleaned:
+            raise ValueError("Intent is empty once emails and paths are removed")
+        text = cleaned
 
         labels = label_intent(text, level)
         event = make_intent(

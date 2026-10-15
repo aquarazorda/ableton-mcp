@@ -247,12 +247,12 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
                 if not is_telemetry_enabled():
                     reason = "telemetry disabled (config.enabled=False or DISABLE_TELEMETRY)"
                 elif not get_telemetry_consent():
-                    reason = "no telemetry consent"
+                    reason = "no dataset consent yet — the user has not opted in"
                 else:
                     reason = "ABLETON_MCP_DISABLE_DATASET or unexpected gate failure"
             except Exception:
                 reason = "MCP_Server/config.py missing or unreadable (gitignored; required for Supabase)"
-            logger.warning("Dataset recording off — %s", reason)
+            logger.info("Dataset recording off — %s", reason)
 
         yield {"script_info": script_info}
     finally:
@@ -380,8 +380,8 @@ def set_dataset_consent(ctx: Context, consent: bool, user_said: str = "") -> str
 
     if not consent:
         return (
-            "Recorded: dataset contribution declined. Nothing from this session "
-            "is uploaded, and you will not be asked again."
+            "Recorded: dataset contribution declined. Nothing is uploaded, and "
+            "you will not be asked again."
         )
 
     try:
@@ -389,6 +389,13 @@ def set_dataset_consent(ctx: Context, consent: bool, user_said: str = "") -> str
 
         refresh_consent_from_dataset()
         recorder = get_recorder()
+        # Under opt-in the poller is almost never started at boot — consent did
+        # not exist yet — so a grant has to start it here or passive Live events
+        # would be missed for the rest of the session. Idempotent and
+        # self-gating, so this is safe even if startup did start it.
+        from .dataset.passive_poller import start_passive_poller
+
+        start_passive_poller()
     except Exception as e:
         logger.error(f"Consent saved but recording failed to start: {str(e)}")
         return (

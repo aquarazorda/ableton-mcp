@@ -6,21 +6,20 @@ the question be asked in the chat itself, once, and remembers the answer.
 
 Three states, and the distinction matters:
 
-    UNKNOWN  — never answered. Recording is ON (opt-out default); the next tool
-               call still surfaces the prompt so the user can decline.
+    UNKNOWN  — never answered. Recording is OFF; the next tool call surfaces the
+               prompt so the user can opt in.
     GRANTED  — the user said yes, in their own words. Recording is ON.
     DENIED   — the user said no. Recording is OFF, permanently, and the question
                is never asked again.
 
-Default-on for UNKNOWN makes this opt-out: recording starts without waiting for
-an answer, and a user who wants no part of it must actively decline — in the
-chat, in the client dialog, or with ``ABLETON_MCP_DISABLE_DATASET``. Note the
-consequence: a client that cannot render the prompt, or a user who never reads
-it, is recorded without having answered. Dataset rows contain prompts, MIDI, and
-device state, so that window is not free — see ``dataset_enabled``.
+Default-off for UNKNOWN makes this opt-in: nothing is recorded until the user
+actively says yes — in the chat, in the client dialog, or with
+``ABLETON_MCP_ENABLE_DATASET``. A client that cannot render the prompt, or a
+user who never reads it, contributes nothing. Dataset rows contain prompts,
+MIDI, and device state, so silence is treated as no.
 
 ``ABLETON_MCP_DISABLE_DATASET`` still overrides everything, and the env-var
-opt-in still works for headless/CI use where no one can answer a chat prompt.
+opt-in works for headless/CI use where no one can answer a chat prompt.
 """
 
 from __future__ import annotations
@@ -38,6 +37,17 @@ logger = logging.getLogger("ableton-mcp-dataset")
 UNKNOWN = "unknown"
 GRANTED = "granted"
 DENIED = "denied"
+
+# Bump ONLY when what gets collected materially changes — a new category of
+# data, not a reworded prompt. A bump re-opens the question for people who
+# already granted, because they consented to the older, narrower scope and
+# cannot be assumed to accept the new one.
+#
+# A bump deliberately does NOT re-ask anyone who said no. Re-prompting a denial
+# with the same question is nagging; the only honest reason to return to a
+# declined user is to tell them the scope changed, and that is a different
+# message than this one. Until that message exists, DENIED is final.
+CONSENT_VERSION = 1
 
 # Consent is per-install, not per-project: the same person answering once should
 # not be re-asked because they opened a different Live set.
@@ -96,8 +106,8 @@ def consent_state() -> str:
     The kill switch wins outright. The env opt-in counts as a grant so headless
     and CI setups keep working without anyone to answer a prompt.
 
-    UNKNOWN is reported as-is rather than collapsed into GRANTED: the prompting
-    logic needs to tell "never answered" from "said yes" so it knows to still
+    UNKNOWN is reported as-is rather than collapsed into DENIED: the prompting
+    logic needs to tell "never answered" from "said no" so it knows to still
     ask. Whether UNKNOWN records is a separate question, answered by
     ``recording_allowed``.
     """
@@ -106,17 +116,33 @@ def consent_state() -> str:
     if _env_flag("ABLETON_MCP_ENABLE_DATASET"):
         return GRANTED
     with _lock:
-        return _read_state().get("state", UNKNOWN)
+        state = _read_state()
+        answer = state.get("state", UNKNOWN)
+        if answer != GRANTED:
+            return answer
+        # A grant is only valid for the scope it was given under. If collection
+        # has widened since, fall back to UNKNOWN: recording stops and the
+        # question is asked again. A stale grant must never authorise data the
+        # user was never told about.
+        #
+        # A grant written before this field existed is treated as version 1,
+        # not as invalid. Those users were asked about, and agreed to, exactly
+        # the scope version 1 describes — the field's absence is our bookkeeping
+        # gap, not a gap in their consent, and re-asking them would be nagging.
+        stored = state.get("consent_version", 1)
+        if not isinstance(stored, int) or stored < CONSENT_VERSION:
+            return UNKNOWN
+        return GRANTED
 
 
 def recording_allowed() -> bool:
-    """True when consent permits recording. Opt-out: UNKNOWN counts as yes.
+    """True when consent permits recording. Opt-in: only GRANTED counts as yes.
 
-    Only an explicit DENIED — the user declining in chat or in the client
-    dialog, or ``ABLETON_MCP_DISABLE_DATASET`` — stops recording. Never having
-    answered does not.
+    An explicit grant — the user agreeing in chat or in the client dialog, or
+    ``ABLETON_MCP_ENABLE_DATASET`` — is required. Never having answered means
+    no recording, so an unanswered or unrenderable prompt contributes nothing.
     """
-    return consent_state() != DENIED
+    return consent_state() == GRANTED
 
 
 def record_consent(granted: bool, quote: str | None = None) -> str:
@@ -132,22 +158,63 @@ def record_consent(granted: bool, quote: str | None = None) -> str:
             "state": state,
             "answered_at": time.time(),
             "user_said": (quote or "").strip()[:500] or None,
+            # Pin the answer to the scope it was given under, so a later
+            # widening of what is collected re-opens the question.
+            "consent_version": CONSENT_VERSION,
+            # A fresh answer clears the ask-throttle. It is only there to stop
+            # an unanswered prompt repeating within a session, and this is an
+            # answer.
+            "last_prompted_at": None,
         })
         _write_state(payload)
-    logger.info("Dataset consent recorded: %s", state)
+    logger.info("Dataset consent recorded: %s (v%d)", state, CONSENT_VERSION)
     return state
 
 
 def needs_prompt() -> bool:
-    """True when the user has never been asked."""
+    """True when the question is open — never answered, or answered under an
+    older collection scope that has since widened."""
     return consent_state() == UNKNOWN
 
 
+# How long to stay quiet after surfacing the question without getting an
+# answer. Long enough that a dismissed prompt does not reappear on the user's
+# very next action, short enough that a later session gets another chance.
+_ASK_COOLDOWN_SEC = 3600
+
+
+def may_ask_now() -> bool:
+    """True when the question is open AND we have not just asked.
+
+    Both the client dialog and the text notice go through this. They used to
+    disagree — only the text path checked the cooldown — so dismissing the
+    dialog re-opened it on the very next tool call. Asking again immediately
+    after someone closed the box is nagging, and it pressures an answer that
+    should be freely given.
+    """
+    if not needs_prompt():
+        return False
+    with _lock:
+        last = _read_state().get("last_prompted_at") or 0
+    return (time.time() - last) >= _ASK_COOLDOWN_SEC
+
+
 def mark_prompted() -> None:
-    """Note that the question has been surfaced, so it is asked once per session."""
+    """Note that the question has been surfaced, so it is not asked again for a while."""
     with _lock:
         payload = dict(_read_state())
         payload["last_prompted_at"] = time.time()
+        # Tie the throttle to the current scope, so a version bump is not
+        # silently muted for an hour by a timestamp from the previous one.
+        payload["prompted_version"] = CONSENT_VERSION
+        _write_state(payload)
+
+
+def _unmark_prompted(previous: float | None) -> None:
+    """Restore the cooldown after an ask that never actually reached the user."""
+    with _lock:
+        payload = dict(_read_state())
+        payload["last_prompted_at"] = previous
         _write_state(payload)
 
 
@@ -155,27 +222,29 @@ CONSENT_NOTICE = (
     "\n\n---\n"
     "[Ask the user this now, before continuing. Do not answer it yourself, and "
     "do not assume — relay their reply verbatim.]\n\n"
-    "**This session is being contributed to the open Ableton MCP training "
-    "dataset. Do you want to keep contributing?**\n\n"
-    "Recording is on by default. What you make here — your prompts, MIDI "
-    "notes, track and clip names, and device settings — is uploaded and may be "
-    "published as part of an open dataset used to train music-production "
-    "models. Email addresses and file paths are stripped first.\n\n"
-    "Reply **no** to stop recording, or **yes** to keep contributing. You will "
-    "only be asked once; you can change your mind later by saying so.\n"
+    "**Would you like to contribute this session to the open Ableton MCP "
+    "training dataset?**\n\n"
+    "Recording is off unless you say yes. If you opt in, what you make here — "
+    "your prompts, MIDI notes, track and clip names, and device settings — is "
+    "uploaded and may be published as part of an open dataset used to train "
+    "music-production models. Email addresses and file paths are stripped "
+    "first.\n\n"
+    "Reply **yes** to contribute, or **no** to decline. Nothing is recorded "
+    "unless you say yes. You will only be asked once; you can change your mind "
+    "later by saying so.\n"
     "---"
 )
 
 
 ELICIT_MESSAGE = (
-    "This session is being contributed to the open Ableton MCP training "
-    "dataset. Keep contributing?\n\n"
-    "Recording is on by default. What you make here — your prompts, MIDI "
-    "notes, track and clip names, and device settings — is uploaded and may be "
-    "published as part of an open dataset used to train music-production "
-    "models. Email addresses and file paths are stripped first.\n\n"
-    "Decline to stop recording. You are asked once, and can change your mind "
-    "later."
+    "Contribute this session to the open Ableton MCP training dataset?\n\n"
+    "Recording is off unless you opt in. If you accept, what you make here — "
+    "your prompts, MIDI notes, track and clip names, and device settings — is "
+    "uploaded and may be published as part of an open dataset used to train "
+    "music-production models. Email addresses and file paths are stripped "
+    "first.\n\n"
+    "Decline and nothing is recorded. You are asked once, and can change your "
+    "mind later."
 )
 
 
@@ -189,22 +258,51 @@ async def try_elicit_consent(ctx: Any) -> str | None:
     does not implement it), which means the caller should fall back to
     appending the text notice. A user who cancels or declines the dialog is a
     real answer, not a fallback.
+
+    The three MCP actions are not interchangeable:
+
+        accept + contribute=True   → GRANTED. The only path that starts recording.
+        accept + contribute=False  → DENIED. They engaged and said no; stop asking.
+        decline                    → DENIED. Same, via the client's own no button.
+        cancel                     → UNKNOWN. Dismissed without deciding, so the
+                                     question survives to a later session.
+
+    That last distinction is the point: a dismissed dialog is not a no, and
+    collapsing it into one would either lose the chance to ask or nag someone
+    who already answered.
     """
-    if ctx is None or not needs_prompt():
+    if ctx is None or not may_ask_now():
         return None
+    # Stamp before awaiting, not after. The dialog is open for as long as the
+    # user ignores it, and other tool calls keep arriving in the meantime; if
+    # the cooldown were only recorded on the way out, each of those would see a
+    # stale timestamp and open a dialog of its own.
+    with _lock:
+        previous = _read_state().get("last_prompted_at")
+    mark_prompted()
     try:
         from pydantic import BaseModel, Field
 
         class DatasetConsent(BaseModel):
+            # default=False is load-bearing: the box must render unchecked, so
+            # an accept with an untouched form is a no rather than a silent yes.
             contribute: bool = Field(
+                default=False,
+                title="Contribute my sessions to the open dataset",
                 description=(
-                    "Yes, contribute my sessions to the open dataset"
+                    "Uploads your prompts, MIDI, track and clip names, and "
+                    "device settings. Leave unchecked to keep them private. "
+                    "You can change this later by saying so in the chat."
                 ),
             )
 
         result = await ctx.elicit(message=ELICIT_MESSAGE, schema=DatasetConsent)
     except Exception as e:
-        # Unsupported client, older mcp, or transport error — text fallback
+        # Unsupported client, older mcp, or transport error — text fallback.
+        # Undo the cooldown stamped above: nothing was ever shown, and leaving
+        # it would suppress the text notice too, which on these clients is the
+        # only way the question ever reaches the user.
+        _unmark_prompted(previous)
         logger.debug("Elicitation unavailable (%s); falling back to text", e)
         return None
 
@@ -212,29 +310,30 @@ async def try_elicit_consent(ctx: Any) -> str | None:
     if action == "accept":
         data = getattr(result, "data", None)
         agreed = bool(getattr(data, "contribute", False))
-        return record_consent(agreed, quote="(via client dialog)")
+        return record_consent(
+            agreed,
+            quote=(
+                "(accepted in client dialog)" if agreed
+                else "(client dialog submitted without opting in)"
+            ),
+        )
     if action == "decline":
         return record_consent(False, quote="(declined in client dialog)")
     # "cancel" — dismissed without answering. Left UNKNOWN so the question can
-    # be asked again in a later session. Under the opt-out default this means
-    # recording continues in the meantime: only an explicit no stops it.
-    logger.debug("Consent dialog dismissed without an answer — recording continues")
-    mark_prompted()
+    # be asked again in a later session (the cooldown was already stamped
+    # above, so not on the user's next keystroke). Under the opt-in default
+    # nothing is recorded in the meantime: only an explicit yes starts it.
+    logger.debug("Consent dialog dismissed without an answer — recording stays off")
     return UNKNOWN
 
 
 def maybe_consent_notice() -> str:
     """Return the consent question to append to a tool result, or "".
 
-    Empty once the user has answered, or if they were already asked this
-    session — the prompt should read as a question, not a nag.
+    Empty once the user has answered, or if they were asked recently — the
+    prompt should read as a question, not a nag.
     """
-    if not needs_prompt():
-        return ""
-    with _lock:
-        last = _read_state().get("last_prompted_at") or 0
-    # Re-ask on a later session if it went unanswered, but never twice in a row
-    if time.time() - last < 3600:
+    if not may_ask_now():
         return ""
     mark_prompted()
     return CONSENT_NOTICE

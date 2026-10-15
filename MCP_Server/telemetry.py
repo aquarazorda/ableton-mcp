@@ -3,8 +3,11 @@ Privacy-focused, anonymous telemetry for Ableton MCP
 Tracks tool usage, DAU/MAU, and performance metrics
 
 Two-tier consent system:
-- Without consent: Only anonymous session/platform info, tool names, success/failure, duration
-- With consent: Also collects prompts, MIDI data, instrument/sound URIs, and other metadata
+- Anonymous tier: install UUID, session ID, platform/version, tool names,
+  success/failure, duration. Carries no user content. On by default; opt out
+  with ABLETON_MCP_DISABLE_TELEMETRY.
+- Rich tier: prompts, MIDI data, instrument/sound URIs, names, and other
+  metadata. Off by default; requires an explicit consent grant.
 """
 
 import contextlib
@@ -84,8 +87,8 @@ class TelemetryEvent:
 
 
 # Consent for the rich tier (prompts, MIDI, names) — opt-in, defaults off. The
-# anonymous tier (tool name, success, duration, platform) is governed by
-# TelemetryConfig.enabled and stays opt-out.
+# anonymous tier (tool name, success, duration, platform) carries no user
+# content, is governed by TelemetryConfig.enabled, and stays opt-out.
 _user_consent: bool = False
 
 
@@ -102,11 +105,11 @@ def get_telemetry_consent() -> bool:
 
 
 def _dataset_opt_in() -> bool:
-    """True when dataset recording is permitted — i.e. not opted out.
+    """True when the user has explicitly opted in to dataset recording.
 
-    Opt-out, matching ``dataset.consent.recording_allowed``: never having
-    answered counts as yes, so the rich tier is live before anyone responds to
-    the prompt. Only an explicit no turns it off.
+    Opt-in, matching ``dataset.consent.recording_allowed``: only an explicit
+    grant counts, so the rich tier stays off until someone answers yes. Never
+    having answered means no.
 
     Imported lazily: telemetry must keep working even if the dataset package is
     unavailable, and this is called during telemetry init.
@@ -167,10 +170,11 @@ class TelemetryCollector:
                 "recording are disabled. Copy it in to enable them."
             )
 
-        # Check if disabled via environment variables
+        # The kill switch wins outright, including over a rich-tier consent
+        # grant: conflicting signals resolve to not sending.
         if self._is_disabled():
             self.config.enabled = False
-            logger.warning("Telemetry disabled via environment variable")
+            logger.info("Telemetry disabled via environment variable")
 
         # Opting in to dataset recording implies consent to the rich tier —
         # dataset rows are a superset of it. The opt-in may arrive either as an
@@ -182,10 +186,14 @@ class TelemetryCollector:
 
         if raw_consent in ("true", "1", "yes", "on"):
             set_telemetry_consent(True)
-            logger.info("Rich telemetry consent granted via environment variable")
+            if self.config.enabled:
+                logger.info("Rich telemetry consent granted")
+            else:
+                # Consent exists but a kill switch is set; nothing will be sent.
+                logger.info("Rich telemetry consent granted, but telemetry is disabled")
         elif raw_consent in ("false", "0", "no", "off"):
             set_telemetry_consent(False)
-            logger.info("Rich telemetry consent declined via environment variable")
+            logger.info("Rich telemetry consent declined")
 
         # Generate or load customer UUID
         self._customer_uuid: str = self._get_or_create_uuid()
@@ -205,7 +213,7 @@ class TelemetryCollector:
         logger.debug(f"Telemetry initialized (enabled={self.config.enabled}, has_supabase={HAS_SUPABASE})")
 
     def _is_disabled(self) -> bool:
-        """Check if telemetry is disabled via environment variables"""
+        """True when a kill switch is set. Disables both tiers outright."""
         disable_vars = [
             "DISABLE_TELEMETRY",
             "ABLETON_MCP_DISABLE_TELEMETRY",

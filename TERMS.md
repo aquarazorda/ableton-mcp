@@ -18,10 +18,15 @@ Both tiers write to a Supabase project (PostgreSQL) over HTTPS. The anon key shi
 
 |  | Anonymous telemetry | Dataset recording |
 |---|---|---|
-| Default | On | **On** |
-| Prompts / MIDI | Never | Yes |
+| Default | On | **Off — opt-in** |
+| Your content (prompts, MIDI, names) | Never | Yes |
 | Device & sound design parameters | Never | Yes |
-| Toggle | `ABLETON_MCP_DISABLE_TELEMETRY=true` | `ABLETON_MCP_DISABLE_DATASET=true` |
+| Turn on | — | `ABLETON_MCP_ENABLE_DATASET=true`, or say yes when asked in the chat |
+| Turn off | `ABLETON_MCP_DISABLE_TELEMETRY=true` | `ABLETON_MCP_DISABLE_DATASET=true` |
+
+**The split is content.** The anonymous tier counts installs and tool calls and carries nothing you made, so it runs by default. Everything that contains your actual work is opt-in and stays off until you say yes.
+
+`ABLETON_MCP_DISABLE_TELEMETRY` turns off both tiers; `ABLETON_MCP_DISABLE_DATASET` turns off dataset recording only and overrides any stored grant.
 
 Neither sends anything unless Supabase credentials are configured. No credentials ship with the package.
 
@@ -37,19 +42,19 @@ Legal basis: legitimate interest in maintaining the software. Opt out any time w
 
 ### Dataset recording
 
-On unless you turn it off. Collects your prompts, your MIDI (pitch, timing, duration, velocity), session structure, track and clip names, preference labels, and browser auditions. No audio is ever recorded or uploaded.
+Off unless you turn it on. Collects your prompts, your MIDI (pitch, timing, duration, velocity), session structure, track and clip names, preference labels, and browser auditions. No audio is ever recorded or uploaded.
 
 It also records **sound design state**: the full parameter set of every device on every track — including devices nested inside instrument, drum, and audio effect racks, and on the master chain. In practice that means envelope settings (attack, decay, sustain, release), filter and LFO settings, oscillator and synth knob positions, effect parameters, macro values, automation state, and per-clip gain, pitch, and warp settings. If you built a patch or dialled in a mix, the resulting parameter values are recorded alongside the action that produced them.
 
 Generic musical labels (`Bass`, `Drums`, `Verse`) are kept for training signal; other names — including rack chain names — become placeholders like `<name:17>`. Emails and absolute paths are stripped from prompts and errors. This is best-effort pattern matching, not a guarantee — it can't catch personal information typed into a prompt in an unanticipated form.
 
-Recording is on by default and starts with your first tool call. You are notified once — as a dialog if your client supports it, otherwise as a message in the chat — and can decline there. Recording continues until you do: an unanswered question does **not** stop it, and on clients that cannot show the prompt you may never be asked at all. Your answer is stored locally in `~/.ableton-mcp/consent.json`.
+Recording is off by default and never starts on its own. You are asked once — as a dialog if your client supports it, otherwise as a message in the chat — and recording begins only if you say yes. An unanswered question means no, and on clients that cannot show the prompt nothing is ever recorded. Your answer is stored locally in `~/.ableton-mcp/consent.json`.
 
-If you are in a jurisdiction where processing this data requires opt-in consent (for example the GDPR, where an opt-out default is generally not a valid legal basis for this kind of personal data), turn recording off with `ABLETON_MCP_DISABLE_DATASET=1` before your first tool call.
+Legal basis: consent, given by you before anything is recorded.
 
 Withdraw consent any time by saying so in the chat, deleting `~/.ableton-mcp/consent.json`, or setting `ABLETON_MCP_DISABLE_DATASET=1`, which overrides any stored answer.
 
-## What you grant by leaving dataset recording on
+## What you grant by turning dataset recording on
 
 A non-exclusive, irrevocable, worldwide, royalty-free license to use your recorded trajectories — prompts, MIDI, session structure, device and sound design parameters, preference labels — to train and evaluate models, and to publish or share datasets derived from them.
 
@@ -57,7 +62,7 @@ Derived datasets may be released publicly or shared with research collaborators.
 
 **You keep ownership and copyright in your music.** This grants use, not exclusivity. Nothing here limits what you do with your own work.
 
-Only leave this on if you have the right to grant that for everything you record. If you're working on someone else's material, under an NDA, or on a label deal with delivery restrictions, turn it off with `ABLETON_MCP_DISABLE_DATASET=1` before your first tool call — it is on until you do.
+Only turn this on if you have the right to grant that for everything you record. If you're working on someone else's material, under an NDA, or on a label deal with delivery restrictions, leave it off — it stays off unless you opt in.
 
 ## Retention and deletion
 

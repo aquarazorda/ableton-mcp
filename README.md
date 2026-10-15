@@ -315,18 +315,27 @@ The system uses a simple JSON-based protocol over TCP sockets:
 
 ## Telemetry
 
-AbletonMCP collects usage data to help improve the tool. This includes:
+There are two tiers, and they have different defaults.
 
-- Anonymous tool usage statistics (which features are used)
-- Anonymous session start information (for daily/monthly active user counts)
-- Anonymous rates and performance metrics
-- Prompts, MIDI notes, track and clip names, and device settings
+**Anonymous telemetry — on by default.** A random install ID, a per-run session ID, which tools ran, whether they succeeded, and how long they took. This is what counts active users and catches broken tools. It contains none of your content: no prompts, no MIDI, no track or clip names, no device settings.
 
-Telemetry is **on** by default. To see exactly what data is collected, see the [Terms & Data Use](TERMS.md).
+**Dataset recording — off by default, opt-in.** Everything with your work in it: prompts, MIDI notes, track and clip names, and device settings, which may be published as part of an open dataset used to train music-production models. Nothing here is collected unless you explicitly turn it on.
 
-### Opting Out
+To see exactly what data each tier collects, see the [Terms & Data Use](TERMS.md).
 
-To disable telemetry, set one of these environment variables before starting the MCP server:
+### Opting in to dataset recording
+
+Either set the environment variable before starting the server:
+
+```bash
+export ABLETON_MCP_ENABLE_DATASET=true
+```
+
+…or answer the question when your client asks it. On your first tool call you're asked once — as a dialog if your client supports MCP elicitation, otherwise as a message in the chat — and answering yes turns it on from that point. Your answer is stored in `~/.ableton-mcp/consent.json`. Declining, or never answering, records nothing. If you dismiss the dialog without choosing, that isn't treated as an answer and you may be asked again in a later session.
+
+### Opting out of anonymous telemetry
+
+Set one of these before starting the MCP server:
 
 ```bash
 export ABLETON_MCP_DISABLE_TELEMETRY=true
@@ -336,6 +345,8 @@ Or use any of these alternatives:
 
 - `DISABLE_TELEMETRY=true`
 - `MCP_DISABLE_TELEMETRY=true`
+
+This also disables dataset recording. `ABLETON_MCP_DISABLE_DATASET=true` turns off dataset recording only, and overrides any stored grant.
 
 For Claude Desktop, add the environment variable to your config:
 
