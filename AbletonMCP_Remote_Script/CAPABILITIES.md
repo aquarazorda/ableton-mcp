@@ -183,46 +183,49 @@ assumptions below are the parts to check first after a restart:
 - Removed the dispatch for `get_browser_categories` / `get_browser_items`,
   whose handlers never existed.
 
-### v1.20.0 — unit-tested against fakes, not yet run in Live
+## Confirmed working (v1.20.0, checked in Live 2026-10-15)
 
-Closes the gaps 1.19 left open in `docs/mcp-gap-report.md`. Tests are in
-`tests/test_automation_loop_sidechain.py` (fake song) and
-`tests/test_mixer_tools.py` (tool layer). Check these first after a restart:
+Run after a full restart against the dub techno set, on a scratch MIDI
+track that was deleted afterwards. Fakes and tests are in
+`tests/test_automation_loop_sidechain.py` and `tests/test_mixer_tools.py`.
 
-- **Device sidechain** (`get_device_sidechain` / `set_device_sidechain`):
+- **Compressor sidechain** (`get_device_sidechain` / `set_device_sidechain`).
   `input_routing_type` / `input_routing_channel` and their `available_*`
-  lists on the device, plus its `S/C On` parameter. Live's LOM docs list
-  these only on `CompressorDevice`. Gate and Auto Filter (`AutoFilter2` in
-  Live 12) have an `S/C On` parameter but no documented routing class, so
-  the script checks the device for the attributes and, when they're
-  missing, errors with the routing-named attributes it does have. The first
-  real call on each device type tells us which way it goes.
-- **Automation targets:** `create_automation` takes `mixer_target`
-  (`volume` / `panning` / `send` + `send_index`) and `chain_path`, and
-  points can give a `display` string instead of a raw value. A clip
-  envelope can only target its own track's parameters. `clear` now uses
-  `Clip.clear_envelope(param)`; the old code called `clear_envelope()` on
-  the envelope, which likely never existed. The last point now gets its own
-  step, so a ramp reaches its final value.
-- **Arrangement automation** (`create_arrangement_automation`): Live's
-  Python API has no handle on a track's arrangement automation lane, so
-  this writes the envelopes of the arrangement clips under the span, with
-  song time mapped to clip time through `start_time` and `start_marker`.
-  A looped clip takes only its first pass. Spans with no clip, and clips
-  that refuse an envelope, are reported. A third-party note says
-  `automation_envelope` returns None for arrangement clips and that only
-  clips which already have an envelope accept writes. If that holds,
-  expect this to work mainly on clips duplicated from Session clips that
-  carry envelopes. Return and master tracks have no clips and are refused.
-- **Read-back** (`get_automation`): samples `AutomationEnvelope.value_at_time`
-  on a Session clip or across arrangement clips, as `[time, value, display]`
-  rows (at most 256). It also reports `DeviceParameter.automation_state`
-  (`none` / `playing` / `overridden`), the only signal for track-lane
-  automation, and readable on returns and master too.
-- **Clip loop** (`set_clip_loop`): `loop_start`, `loop_end`, `length`,
-  `looping` on Session clips. `Clip.length` is read-only, so `length` moves
-  `loop_end`. Start and end are written in whichever order keeps
-  start < end at every step.
+  lists exist on Compressor as the LOM says. Sources list tracks by bare
+  name ("Kick"), returns as "A-Reverb", plus "Main" and "No Input".
+  Channels are "Pre FX", "Post FX" and "Post Mixer". Routing to a track
+  (`source_track_index`), to a return, by `source` name, a channel change
+  and `enable=False` all round-tripped.
+- **Clip automation on mixer targets** (`create_automation` with
+  `mixer_target="send"`, `send_index=0`) and **display-string points**
+  ("-inf dB", "-6 dB", "-20 dB" on a send; "200 Hz" → "2 kHz" on Auto
+  Filter Frequency) land on the exact display values.
+  `Clip.clear_envelope(param)` exists and clears: `clear=True` removed the
+  old tail, and `clear=False` kept it. The last point's own step reaches the
+  final value.
+- **`get_automation` on Session clips.** Live's `value_at_time` returns
+  the *previous* step's value when sampled exactly on a step boundary, so
+  reading on the 1/16 grid lagged one step. Since then the script samples
+  1e-4 beats after each time. That fix is covered by the fake but hasn't been
+  re-run in Live (it needs a restart). Readings between grid lines were
+  already right. `automation_state` reads correctly: `none` before, then
+  `playing` once the track had arrangement automation.
+- **Arrangement automation, the route that works:** write the envelope on a
+  Session clip with `create_clip_automation`, then
+  `duplicate_session_clip_to_arrangement`. Live moves the clip's envelopes
+  (device and mixer parameters) onto the **track's arrangement automation**
+  over the clip's span. The arrangement clip itself then has no envelope.
+  Moving the playhead confirmed it: Auto Filter read 399 Hz at clip beat
+  2.1 and 1 kHz at 5.1, and its own 10 kHz outside the span. The duplicate
+  replaces whatever that track had in the span.
+- **`set_clip_loop`** on a looped Session clip: move later (0–8 → 4–12),
+  move earlier (→ 1–3) and lengthen (`length=16` → 1–17) all landed. On an
+  unlooped clip, `loop_start`/`loop_end` are the clip's start and end
+  markers. Live remembers the loop brace separately and restores it when
+  `looping` goes back on. Two fixes followed. Read straight after a
+  write, `end_marker` showed the old value, so an unlooped result now
+  reports the written start/end as the markers. And a `looping`-only call no
+  longer rewrites the loop positions.
 
 ## Genuinely inconclusive — needs a clean re-test
 
@@ -233,6 +236,23 @@ Closes the gaps 1.19 left open in `docs/mcp-gap-report.md`. Tests are in
   thing after a fresh restart, not bundled with anything else.
 
 ## Confirmed absent — not a Remote Script capability at all
+
+- **Gate and Auto Filter sidechain routing** (checked in Live 2026-10-15).
+  Both have an `S/C On` parameter (Gate index 10, Auto Filter
+  `AutoFilter2` index 42), but no attribute with "rout" in its name, so
+  there's no way to pick their sidechain source. `set_device_sidechain`
+  errors and leaves the device untouched. Setting the source is UI-only.
+- **Writing or reading arrangement automation directly** (checked in Live
+  2026-10-15). `Clip.create_automation_envelope` on an arrangement clip
+  raises "Not a session clip or parameter belongs to another track". That
+  held for a plain clip, for one duplicated from a Session clip that had
+  envelopes, and for one with a hand-drawn clip envelope.
+  `automation_envelope` returns None for all three. That makes sense: in
+  the Arrangement, a clip's device and mixer envelopes are modulation, and
+  automation lives on the track lane, which the API doesn't expose. So
+  `create_arrangement_automation` always errors, and `get_automation`
+  without `clip_index` returns no rows. Use the Session-clip duplicate
+  route above instead.
 
 - **Freeze / render / export / bounce.** `investigate_render_capability`
   filtered `dir()` on Track, Song, and Application for any attribute

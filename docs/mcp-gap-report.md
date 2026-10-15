@@ -9,7 +9,7 @@ These are field notes from one production session: a minimal dub techno groove a
 
 ## Status (v1.20.0)
 
-1.19 and 1.20 are unit-tested against a fake Live song; **neither has run in Live yet**. Install the script with `ableton-mcp-install-script` and restart Live fully before relying on it.
+1.20 was run in Live 12 on 2026-10-15, on a scratch track in the dub techno set. Results are in the rows below, and in `AbletonMCP_Remote_Script/CAPABILITIES.md`. 1.19 is still unit-tested only, except for the parts the 1.20 checks used along the way: `search_browser`, `get_mixer` display strings, `name_filter`, and display-string values. Install the script with `ableton-mcp-install-script` and restart Live fully before relying on it.
 
 | # | Gap | Status |
 |---|---|---|
@@ -17,14 +17,14 @@ These are field notes from one production session: a minimal dub techno groove a
 | 1 | Mixer | `get_mixer`, `set_mixer` (volume_db, pan, sends_db, mute, solo, arm) |
 | 2 | Return / master | `track_type` on device, mixer, routing and load tools |
 | 3 | Display values | `display` + `value_items` on parameters; `display_value` on `set_device_parameter` |
-| 4 | Routing / sidechain | `get_track_routing` / `set_track_routing` with channels. 1.20: `get_device_sidechain` / `set_device_sidechain` (source track, tap channel, S/C On). Compressor is documented in the LOM. Gate and Auto Filter depend on whether Live exposes the same routing attributes on them, and the script reports it when it doesn't. |
+| 4 | Routing / sidechain | `get_track_routing` / `set_track_routing` with channels. 1.20: `get_device_sidechain` / `set_device_sidechain` (source track or return, tap channel, S/C On) **work on Compressor in Live**. **Gate and Auto Filter expose no sidechain routing to Remote Scripts** (no routing attributes at all), so their sidechain source can only be set by hand. The tools say so. |
 | 5 | Rack devices | `chain_path` on get / set / delete / move |
 | 6 | Drum pad notes | `drum_pads` on drum racks |
 | 7 | Payload size | Chains summarized by default, `name_filter`, compact rows, no indent |
 | 8 | Browser | `search_browser`, and paging on `get_browser_items_at_path` |
-| 9 | Automation | `create_clip_automation` with mixer targets (volume, pan, sends), `chain_path` and display-string points. 1.20: `create_arrangement_automation` writes the envelopes of the arrangement clips under a span, and `get_automation` reads envelopes back plus `automation_state`. **Live's API has no track automation lane, so returns and master, and arrangement spans with no clip, still can't be automated.** |
+| 9 | Automation | `create_clip_automation` with mixer targets (volume, pan, sends), `chain_path` and display-string points. Verified in Live in 1.20, including send A from display strings and `clear`. `get_automation` reads Session clip envelopes back and reports `automation_state`. **Arrangement automation can't be written or read directly:** Live refuses envelopes on arrangement clips, even ones duplicated from enveloped Session clips or with a hand-drawn clip envelope, so `create_arrangement_automation` always errors. **What works:** `create_clip_automation` on a Session clip, then `duplicate_to_arrangement`. Live turns the clip envelopes into track automation over the clip's span (checked by moving the playhead). Returns and master still can't be automated. |
 | 10 | Device management | `delete_device`, `move_device`, load `position`; the load result reports the device index |
-| 11 | Scenes / clips | `fire_scene`, `create_scene`, `delete_scene`, `set_clip_launch_settings`, grooves. 1.20: `set_clip_loop` (loop_start, loop_end, length, looping). **Still missing: arrangement trim/split.** |
+| 11 | Scenes / clips | `fire_scene`, `create_scene`, `delete_scene`, `set_clip_launch_settings`, grooves. 1.20: `set_clip_loop` (loop_start, loop_end, length, looping) verified in Live: move later, move earlier, lengthen, and start/end on unlooped clips. **Still missing: arrangement trim/split.** |
 | 12 | Note editing | `update_notes`, `remove_notes` |
 | 13 | Metering | `get_meters` (peaks/averages on Live's meter scale). **Still missing: render, LUFS.** |
 | 14 | Indices | Track creation and load report indices |

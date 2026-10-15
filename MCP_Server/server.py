@@ -1448,7 +1448,9 @@ def duplicate_to_arrangement(
 
     Uses Live's track.duplicate_clip_to_arrangement() API (Live 11 / 12).
     The clip is placed at destination_time beats from the start of the
-    arrangement on the same track it lives in.
+    arrangement on the same track it lives in. Its clip envelopes (from
+    create_clip_automation) become the track's arrangement automation over
+    the clip's span, which is the way to automate the Arrangement.
 
     Typical workflow:
       1. create_clip / add_notes_to_clip to build a Session clip
@@ -2424,15 +2426,15 @@ def create_arrangement_automation(
     user_prompt: str = "",
 ) -> str:
     """
-    Write automation across a span of the Arrangement, in song beats.
+    Try to write automation across a span of the Arrangement, in song beats.
 
-    Live's API gives no access to a track's own automation lane, so this
-    writes the envelopes of the arrangement clips under the span (the
-    Arrangement plays them as automation). Parts of the span with no clip,
-    and clips Live refuses an envelope for, are reported. Return and master
-    tracks have no clips, so they can't be automated this way. If nothing
-    can be written, put the automation on a Session clip with
-    create_clip_automation and duplicate_to_arrangement it instead.
+    Live 12 refuses this: its API has no handle on a track's automation
+    lane, and it won't create or return envelopes on arrangement clips, so
+    expect an error naming each refused clip. What works instead: write
+    the automation on a Session clip with create_clip_automation, then
+    duplicate_to_arrangement that clip at the target beat. Live moves the
+    clip's envelopes onto the track's arrangement automation there, and
+    the duplicate replaces whatever that track had in the span.
 
     Parameters:
     - track_index: Regular track (not a return or the master)
@@ -2493,10 +2495,11 @@ def get_automation(
     Read a parameter's automation back as sampled [time, value, display] rows.
 
     With clip_index, samples that Session clip's envelope (clip beats).
-    Without it, samples the envelopes of the track's arrangement clips
-    (song beats). automation_state reports whether the parameter has track
-    automation ("playing", or "overridden" after a manual change), which is
-    readable on returns and master too even though their envelopes aren't.
+    Without it, lists the track's arrangement clips, but Live 12 returns
+    no envelope for them, so there are no rows to read. automation_state
+    reports whether the parameter has track automation ("playing", or
+    "overridden" after a manual change); it's the only Arrangement signal,
+    and it works on returns and master too.
 
     Parameters:
     - track_index: Track index within its track_type

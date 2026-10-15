@@ -1387,23 +1387,24 @@ class AbletonMCP(ControlSurface):
                 raise ValueError("Pass loop_end or length, not both")
             if looping is not None:
                 clip.looping = bool(looping)
-            start = float(clip.loop_start if loop_start is None else loop_start)
-            if length is not None:
-                end = start + float(length)
-            elif loop_end is not None:
-                end = float(loop_end)
-            else:
-                end = float(clip.loop_end)
-            if end <= start:
-                raise ValueError(
-                    "Loop end (%g) must be after loop start (%g)" % (end, start))
-            if start >= float(clip.loop_end):
-                clip.loop_end = end
-                clip.loop_start = start
-            else:
-                clip.loop_start = start
-                clip.loop_end = end
-            return {
+            if loop_start is not None or loop_end is not None or length is not None:
+                start = float(clip.loop_start if loop_start is None else loop_start)
+                if length is not None:
+                    end = start + float(length)
+                elif loop_end is not None:
+                    end = float(loop_end)
+                else:
+                    end = float(clip.loop_end)
+                if end <= start:
+                    raise ValueError(
+                        "Loop end (%g) must be after loop start (%g)" % (end, start))
+                if start >= float(clip.loop_end):
+                    clip.loop_end = end
+                    clip.loop_start = start
+                else:
+                    clip.loop_start = start
+                    clip.loop_end = end
+            result = {
                 "loop_start": float(clip.loop_start),
                 "loop_end": float(clip.loop_end),
                 "length": float(clip.length),
@@ -1411,6 +1412,12 @@ class AbletonMCP(ControlSurface):
                 "start_marker": float(clip.start_marker),
                 "end_marker": float(clip.end_marker),
             }
+            if not result["looping"]:
+                # Unlooped, loop_start/loop_end are the clip's start and
+                # end; the marker attributes can still read stale this tick.
+                result["start_marker"] = result["loop_start"]
+                result["end_marker"] = result["loop_end"]
+            return result
         except Exception as e:
             self.log_message("Error setting clip loop: " + str(e))
             self.log_message(traceback.format_exc())
@@ -2544,6 +2551,12 @@ class AbletonMCP(ControlSurface):
         automation lane, so this writes the envelope of each arrangement
         clip under the span instead. Spans with no clip, and clips Live
         refuses an envelope for, are reported rather than skipped silently.
+
+        In Live 12.4 every arrangement clip refuses: create_automation_envelope
+        raises "Not a session clip or parameter belongs to another track",
+        and automation_envelope returns None even for a hand-drawn clip
+        envelope. The working route is a Session clip envelope duplicated
+        to the Arrangement, which Live turns into track automation.
         """
         try:
             if (track_type or "track") != "track":
@@ -2593,9 +2606,10 @@ class AbletonMCP(ControlSurface):
             if not covered:
                 raise Exception(
                     "Nothing written for '%s' between beats %g and %g: %s. Live "
-                    "only accepts arrangement automation inside clips that take "
-                    "an envelope; write it on a Session clip and duplicate that "
-                    "to the Arrangement instead."
+                    "12 refuses envelopes on arrangement clips. Write it on a "
+                    "Session clip with create_clip_automation and duplicate that "
+                    "clip to the Arrangement: Live moves its envelopes onto the "
+                    "track's arrangement automation."
                     % (param.name, start, pts[-1][0],
                        "; ".join("clip %d: %s" % (r["clip_index"], r["reason"]) for r in refused)
                        or "no arrangement clip on this track covers that span"))
@@ -2612,10 +2626,12 @@ class AbletonMCP(ControlSurface):
 
     def _sample_envelope(self, envelope, param, lo, hi, step, offset=0.0,
                          inclusive=True):
+        # On a step boundary Live's value_at_time returns the step before
+        # it, so read just after each sample time.
         rows = []
         t = lo
         while t < hi + (1e-9 if inclusive else -1e-9):
-            v = float(envelope.value_at_time(t - offset))
+            v = float(envelope.value_at_time(t - offset + 1e-4))
             rows.append([round(t, 4), round(v, 6), self._param_display(param, v)])
             t += step
         return rows

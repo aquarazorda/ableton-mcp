@@ -14,7 +14,9 @@ from test_live_surface import FakeDevice, FakeParam, FakeSong, FakeTrack, make_l
 # ------------------------------------------------------------------ fakes
 
 class FakeEnvelope(object):
-    """Step envelope: a value holds from its step's start until the next."""
+    """Step envelope: a value holds from just after its step's start until
+    the next. Like Live, reading exactly on a boundary gives the step
+    before it."""
 
     def __init__(self, initial):
         self.initial = initial
@@ -24,7 +26,7 @@ class FakeEnvelope(object):
         self.steps[round(time, 6)] = value
 
     def value_at_time(self, time):
-        before = [t for t in self.steps if t <= time + 1e-9]
+        before = [t for t in self.steps if t < time]
         return self.steps[max(before)] if before else self.initial
 
 
@@ -166,6 +168,18 @@ def test_clip_loop_refuses_loop_end_and_length_together():
 
     assert reply["status"] == "error"
     assert clip.loop_end == 4.0
+
+
+def test_unlooped_clip_reports_its_new_start_and_end_as_markers():
+    """Unlooped, loop_start/loop_end are the clip's start and end, but Live
+    can still show the old end_marker in the same tick."""
+    clip = FakeClip(loop_start=0.0, loop_end=8.0, looping=False)
+    live = make_live(FakeSong([clip_track("Bass", [clip])]))
+
+    result = run(live, "set_clip_loop", track_index=0, clip_index=0,
+                 loop_start=2.0, length=4.0)
+
+    assert (result["start_marker"], result["end_marker"]) == (2.0, 6.0)
 
 
 # -------------------------------------------------------------- automation
