@@ -7,6 +7,30 @@ These are field notes from one production session: a minimal dub techno groove a
 
 **Headline:** the Remote Script advertises 49 commands, and 31 of them have no MCP tool. The rest of the Live-side work is mostly done; the tool layer is missing.
 
+## Status (v1.19.0, branch docs/mcp-gap-report)
+
+Unit-tested against a fake Live song; **not yet run in Live**. Install the script with `ableton-mcp-install-script` and restart Live fully before relying on it.
+
+| # | Gap | Status |
+|---|---|---|
+| 0 | Stale uvx server / handshake | Handshake fixed (newer script = compatible). Pointing the config at the local checkout is still a manual step. |
+| 1 | Mixer | `get_mixer`, `set_mixer` (volume_db, pan, sends_db, mute, solo, arm) |
+| 2 | Return / master | `track_type` on device, mixer, routing and load tools |
+| 3 | Display values | `display` + `value_items` on parameters; `display_value` on `set_device_parameter` |
+| 4 | Routing / sidechain | `get_track_routing` / `set_track_routing` with channels. **Device sidechain inputs are still not reachable.** |
+| 5 | Rack devices | `chain_path` on get / set / delete / move |
+| 6 | Drum pad notes | `drum_pads` on drum racks |
+| 7 | Payload size | Chains summarized by default, `name_filter`, compact rows, no indent |
+| 8 | Browser | `search_browser`, and paging on `get_browser_items_at_path` |
+| 9 | Automation | `create_clip_automation` (Session clips, top-level devices). **Still missing: arrangement automation, mixer-parameter targets, read-back.** |
+| 10 | Device management | `delete_device`, `move_device`, load `position`; the load result reports the device index |
+| 11 | Scenes / clips | `fire_scene`, `create_scene`, `delete_scene`, `set_clip_launch_settings`, grooves. **Still missing: clip loop/length, arrangement trim/split.** |
+| 12 | Note editing | `update_notes`, `remove_notes` |
+| 13 | Metering | `get_meters` (peaks/averages on Live's meter scale). **Still missing: render, LUFS.** |
+| 14 | Indices | Track creation and load report indices |
+| 15 | Undo | `undo` / `redo` |
+| 16 | Broken commands | Dead browser dispatch removed |
+
 ---
 
 ## P0: fix first

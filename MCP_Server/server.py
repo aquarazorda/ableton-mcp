@@ -139,14 +139,25 @@ class AbletonConnection:
             # Arrangement view commands
             "switch_to_arrangement_view", "set_current_song_time",
             "duplicate_session_clip_to_arrangement",
-            "create_locator"
+            "create_locator",
+            "load_browser_item", "set_mixer_value", "set_track_state",
+            "delete_device", "move_device", "delete_track", "set_track_routing",
+            "create_automation", "update_notes", "remove_notes_range",
+            "set_clip_launch_settings", "set_clip_groove", "create_scene",
+            "delete_scene", "fire_scene", "undo", "redo",
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
         # than the default modifying-command budget (e.g. importing/decoding a
         # large audio file). Give them a wider socket timeout so we don't time
         # out before the Remote Script's own queue does.
-        long_running_commands = {"create_audio_clip": 65.0}
+        long_running_commands = {
+            "create_audio_clip": 65.0,
+            # Samples meters for up to 10 s before replying.
+            "get_meters": 20.0,
+            # The first search of a browser root walks and caches it.
+            "search_browser": 90.0,
+        }
         
         try:
             logger.info(f"Sending command: {command_type} with params: {params}")
@@ -353,6 +364,69 @@ def get_ableton_connection():
     return _ableton_connection
 
 
+TRACK_TYPES = ("track", "return", "master")
+
+
+def _missing_features(track_type: str = "track", chain_path=None,
+                      display_value=None, extra=()) -> str | None:
+    """Refuse parameters an older Remote Script would silently ignore.
+
+    A pre-1.19 script drops track_type, so a call meant for a return track
+    would land on the regular track with the same index. Check first.
+    """
+    from .script_handshake import require_capability
+
+    if track_type not in TRACK_TYPES:
+        return f"Unknown track_type '{track_type}' — use one of {', '.join(TRACK_TYPES)}"
+    needed = list(extra)
+    if track_type != "track":
+        needed.append("track_type")
+    if chain_path:
+        needed.append("chain_path")
+    if display_value is not None:
+        needed.append("display_value")
+    for name in needed:
+        missing = require_capability(name)
+        if missing:
+            return missing
+    return None
+
+
+def _compact_json(result: Any) -> str:
+    return json.dumps(result, separators=(",", ":"), default=str)
+
+
+PARAMETER_COLUMNS = ["index", "name", "value", "min", "max", "display", "value_items"]
+
+
+def _compact_device(device: Dict[str, Any]) -> Dict[str, Any]:
+    """Parameters as rows (see PARAMETER_COLUMNS) instead of verbose objects."""
+    out = {k: v for k, v in device.items() if k not in ("parameters", "chains")}
+    params = device.get("parameters")
+    if params is not None:
+        rows = []
+        for p in params:
+            row = [p.get("index"), p.get("name"), round(float(p.get("value", 0.0)), 4),
+                   p.get("min"), p.get("max"), p.get("display")]
+            if p.get("value_items"):
+                row.append(p["value_items"])
+            rows.append(row)
+        out["parameters"] = rows
+    chains = device.get("chains")
+    if chains is not None:
+        out["chains"] = [
+            {
+                **{k: v for k, v in chain.items() if k != "devices"},
+                "devices": [
+                    _compact_device(d) if isinstance(d, dict) else d
+                    for d in chain.get("devices", [])
+                ],
+            }
+            for chain in chains
+        ]
+    return out
+
+
 # Core Tool endpoints
 
 @mcp.tool()
@@ -517,23 +591,53 @@ def get_device_parameters(
     ctx: Context,
     track_index: int,
     device_index: int,
+    track_type: str = "track",
+    chain_path: List[int] | None = None,
+    include_chains: bool = False,
+    name_filter: str = "",
+    compact: bool = True,
     user_prompt: str = "",
 ) -> str:
     """
-    Read all parameters for a device on a track (name, value, min, max).
+    Read a device's parameters, with Live's display string for each value.
+
+    Racks list their chains (name, devices, drum-pad note) without nested
+    parameters; reach a nested device with chain_path. Drum racks also list
+    drum_pads: the MIDI note that triggers each filled pad.
 
     Parameters:
-    - track_index: Track that owns the device
+    - track_index: Track that owns the device (index within its track_type)
     - device_index: Index into the track's device chain
+    - track_type: "track" (default), "return" or "master"
+    - chain_path: Walk into racks: [chain_index, device_index, ...] pairs after
+      device_index. [3, 0] = first device in chain 3 of the rack.
+    - include_chains: Also return every nested device's parameters (large)
+    - name_filter: Case-insensitive regex on parameter names, e.g. "freq|gain|output"
+    - compact: Parameters as rows [index, name, value, min, max, display,
+      value_items?] instead of objects (default True)
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
+        missing = _missing_features(track_type, chain_path)
+        if missing:
+            return missing
+        params: Dict[str, Any] = {
+            "track_index": track_index,
+            "device_index": device_index,
+            "include_chains": include_chains,
+        }
+        if track_type != "track":
+            params["track_type"] = track_type
+        if chain_path:
+            params["chain_path"] = chain_path
+        if name_filter:
+            params["name_filter"] = name_filter
         ableton = get_ableton_connection()
-        result = ableton.send_command(
-            "get_device_parameters",
-            {"track_index": track_index, "device_index": device_index},
-        )
-        return json.dumps(result, indent=2)
+        result = ableton.send_command("get_device_parameters", params)
+        if compact and isinstance(result.get("device"), dict):
+            result["device"] = _compact_device(result["device"])
+            result["parameter_columns"] = PARAMETER_COLUMNS
+        return _compact_json(result)
     except Exception as e:
         logger.error(f"Error getting device parameters: {str(e)}")
         return f"Error getting device parameters: {str(e)}"
@@ -547,35 +651,59 @@ def set_device_parameter(
     track_index: int,
     device_index: int,
     parameter_index: int,
-    value: float,
+    value: float | None = None,
+    display_value: str | None = None,
+    track_type: str = "track",
+    chain_path: List[int] | None = None,
     user_prompt: str = "",
 ) -> str:
     """
-    Set a device parameter to a specific value.
+    Set a device parameter by raw value or by the value Live displays.
 
-    Use get_device_parameters first to discover parameter indices and ranges.
+    Use get_device_parameters first to discover parameter indices, ranges and
+    display strings. display_value is usually easier than value: Live's raw
+    values are often normalized 0..1 with a hidden curve.
 
     Parameters:
-    - track_index: Track that owns the device
+    - track_index: Track that owns the device (index within its track_type)
     - device_index: Index into the track's device chain
     - parameter_index: Index into device.parameters
-    - value: New parameter value (Live parameter units)
+    - value: New raw parameter value (between the parameter's min and max)
+    - display_value: Target as Live shows it, e.g. "180 Hz", "1.2 kHz",
+      "-6 dB", "35 %", "250 ms", or a value_items entry like "Bell".
+      Overrides value.
+    - track_type: "track" (default), "return" or "master"
+    - chain_path: [chain_index, device_index, ...] pairs to reach a device
+      inside a rack (see get_device_parameters)
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
+        if value is None and display_value is None:
+            return "Error setting device parameter: pass value or display_value"
+        missing = _missing_features(track_type, chain_path, display_value)
+        if missing:
+            return missing
+        params: Dict[str, Any] = {
+            "track_index": track_index,
+            "device_index": device_index,
+            "parameter_index": parameter_index,
+        }
+        if value is not None:
+            params["value"] = value
+        if display_value is not None:
+            params["display_value"] = display_value
+        if track_type != "track":
+            params["track_type"] = track_type
+        if chain_path:
+            params["chain_path"] = chain_path
         ableton = get_ableton_connection()
-        result = ableton.send_command(
-            "set_device_parameter",
-            {
-                "track_index": track_index,
-                "device_index": device_index,
-                "parameter_index": parameter_index,
-                "value": value,
-            },
-        )
+        result = ableton.send_command("set_device_parameter", params)
+        old = result.get("old_display") or result.get("old_value")
+        new = result.get("display") or result.get("value")
         return (
-            f"Set {result.get('name', 'parameter')} "
-            f"{result.get('old_value')} → {result.get('value')}"
+            f"Set {result.get('device_name', 'device')} › "
+            f"{result.get('name', 'parameter')}: {old} → {new} "
+            f"(raw {result.get('value')})"
         )
     except Exception as e:
         logger.error(f"Error setting device parameter: {str(e)}")
@@ -637,7 +765,10 @@ def create_midi_track(ctx: Context, index: int = -1, user_prompt: str = "") -> s
     try:
         ableton = get_ableton_connection()
         result = ableton.send_command("create_midi_track", {"index": index})
-        return f"Created new MIDI track: {result.get('name', 'unknown')}"
+        return (
+            f"Created new MIDI track {result.get('index')}: "
+            f"{result.get('name', 'unknown')}"
+        )
     except Exception as e:
         logger.error(f"Error creating MIDI track: {str(e)}")
         return f"Error creating MIDI track: {str(e)}"
@@ -660,7 +791,10 @@ def create_audio_track(ctx: Context, index: int = -1, user_prompt: str = "") -> 
     try:
         ableton = get_ableton_connection()
         result = ableton.send_command("create_audio_track", {"index": index})
-        return f"Created new audio track: {result.get('name', 'unknown')}"
+        return (
+            f"Created new audio track {result.get('index')}: "
+            f"{result.get('name', 'unknown')}"
+        )
     except Exception as e:
         logger.error(f"Error creating audio track: {str(e)}")
         return f"Error creating audio track: {str(e)}"
@@ -889,32 +1023,54 @@ def set_tempo(ctx: Context, tempo: float, user_prompt: str = "") -> str:
 @mcp.tool()
 @rich_telemetry_tool("load_instrument_or_effect")
 @trajectory_tool("load_instrument_or_effect")
-def load_instrument_or_effect(ctx: Context, track_index: int, uri: str, user_prompt: str = "") -> str:
+def load_instrument_or_effect(
+    ctx: Context,
+    track_index: int,
+    uri: str,
+    track_type: str = "track",
+    position: int | None = None,
+    user_prompt: str = "",
+) -> str:
     """
     Load an instrument or effect onto a track using its URI.
 
+    Find URIs with search_browser. Live inserts the device after the selected
+    one; pass position to put it at a specific index in the chain.
+
     Parameters:
-    - track_index: The index of the track to load the instrument on
+    - track_index: The track to load onto (index within its track_type)
     - uri: The URI of the instrument or effect to load (e.g., 'query:Synths#Instrument%20Rack:Bass:FileId_5116')
+    - track_type: "track" (default), "return" or "master"
+    - position: Device index to move the loaded device to (0 = first)
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
+        missing = _missing_features(track_type)
+        if missing:
+            return missing
+        params: Dict[str, Any] = {"track_index": track_index, "item_uri": uri}
+        if track_type != "track":
+            params["target"] = track_type
+        if position is not None:
+            params["position"] = position
         ableton = get_ableton_connection()
-        result = ableton.send_command("load_browser_item", {
-            "track_index": track_index,
-            "item_uri": uri
-        })
-        
-        # Check if the instrument was loaded successfully
-        if result.get("loaded", False):
-            new_devices = result.get("new_devices", [])
-            if new_devices:
-                return f"Loaded instrument with URI '{uri}' on track {track_index}. New devices: {', '.join(new_devices)}"
-            else:
-                devices = result.get("devices_after", [])
-                return f"Loaded instrument with URI '{uri}' on track {track_index}. Devices on track: {', '.join(devices)}"
-        else:
+        result = ableton.send_command("load_browser_item", params)
+
+        if not result.get("loaded", False):
             return f"Failed to load instrument with URI '{uri}'"
+        where = f"{track_type} {track_index}" if track_type != "master" else "master"
+        devices = result.get("devices") or []
+        chain = ", ".join(f"{i}:{name}" for i, name in enumerate(devices))
+        device_index = result.get("device_index")
+        if device_index is None:
+            return (
+                f"Loaded '{result.get('item_name', uri)}' on {where}. "
+                f"Devices: {chain or 'unknown'}"
+            )
+        return (
+            f"Loaded '{result.get('item_name', uri)}' on {where} at device "
+            f"index {device_index}. Devices: {chain}"
+        )
     except Exception as e:
         logger.error(f"Error loading instrument by URI: {str(e)}")
         return f"Error loading instrument by URI: {str(e)}"
@@ -1100,20 +1256,33 @@ def get_browser_tree(ctx: Context, category_type: str = "all", user_prompt: str 
 @mcp.tool()
 @rich_telemetry_tool("get_browser_items_at_path")
 @trajectory_tool("get_browser_items_at_path")
-def get_browser_items_at_path(ctx: Context, path: str, user_prompt: str = "") -> str:
+def get_browser_items_at_path(
+    ctx: Context,
+    path: str,
+    offset: int = 0,
+    limit: int = 100,
+    user_prompt: str = "",
+) -> str:
     """
-    Get browser items at a specific path in Ableton's browser.
+    Get browser items at a specific path in Ableton's browser, one page at a time.
+
+    To find something by name, search_browser is usually faster.
 
     Parameters:
     - path: Path in the format "category/folder/subfolder"
             where category is one of the available browser categories in Ableton
+    - offset: First item to return (for paging; see has_more and total)
+    - limit: Maximum items to return (default 100)
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
+        from .script_handshake import script_has_capability
+
+        params: Dict[str, Any] = {"path": path}
+        if script_has_capability("browser_paging"):
+            params.update({"offset": offset, "limit": limit})
         ableton = get_ableton_connection()
-        result = ableton.send_command("get_browser_items_at_path", {
-            "path": path
-        })
+        result = ableton.send_command("get_browser_items_at_path", params)
         
         # Check if there was an error with available categories
         if "error" in result and "available_categories" in result:
@@ -1122,7 +1291,7 @@ def get_browser_items_at_path(ctx: Context, path: str, user_prompt: str = "") ->
             return (f"Error: {error}\n"
                    f"Available browser categories: {', '.join(available_cats)}")
         
-        return json.dumps(result, indent=2)
+        return _compact_json(result)
     except Exception as e:
         error_msg = str(e)
         if "Browser is not available" in error_msg:
@@ -1555,6 +1724,702 @@ def record_audition(
         logger.error(f"Error recording audition: {str(e)}")
         return f"Error recording audition: {str(e)}"
 
+
+
+# ── Mixer, routing, device management and editing ─────────────────────────────
+
+def _send(command: str, params: Dict[str, Any] | None = None,
+          capability: str | None = None) -> Dict[str, Any] | str:
+    """Send a command after checking the Remote Script supports it.
+
+    Returns the result dict, or an error string to hand straight back.
+    """
+    from .script_handshake import require_capability
+
+    missing = require_capability(capability or command)
+    if missing:
+        return missing
+    return get_ableton_connection().send_command(command, params or {})
+
+
+def _volume_display(db: float) -> str:
+    return "-inf dB" if db <= -70 else f"{db} dB"
+
+
+def _send_index(key: str) -> int:
+    """Send keys may be an index ("0") or a return letter ("A")."""
+    key = str(key).strip()
+    if key.isdigit():
+        return int(key)
+    if len(key) == 1 and key.isalpha():
+        return ord(key.upper()) - ord("A")
+    raise ValueError(f"Send key '{key}' is neither an index nor a return letter")
+
+
+@mcp.tool()
+@telemetry_tool("get_mixer")
+@trajectory_tool("get_mixer", modifying=False)
+def get_mixer(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Read volume, pan, sends, mute and solo for every track, return and master.
+
+    Volume and send levels include Live's display string ("-6.0 dB").
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _send("get_mixer")
+        if isinstance(result, str):
+            return result
+
+        def line(t: Dict[str, Any]) -> str:
+            label = {"track": "", "return": "return ", "master": ""}[t["track_type"]]
+            parts = [f"{label}{t['index']} {t['name']}" if t["track_type"] != "master" else "master",
+                     f"vol {t.get('volume_display')}", f"pan {t.get('panning_display')}"]
+            for send in t.get("sends", []):
+                parts.append(f"send {chr(ord('A') + send['index'])} {send.get('display')}")
+            if t.get("mute"):
+                parts.append("MUTED")
+            if t.get("solo"):
+                parts.append("SOLO")
+            return " | ".join(parts)
+
+        rows = [line(t) for t in result.get("tracks", [])]
+        rows += [line(t) for t in result.get("returns", [])]
+        if result.get("master"):
+            rows.append(line(result["master"]))
+        return "\n".join(rows)
+    except Exception as e:
+        logger.error(f"Error reading mixer: {str(e)}")
+        return f"Error reading mixer: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("set_mixer")
+@trajectory_tool("set_mixer")
+def set_mixer(
+    ctx: Context,
+    track_index: int,
+    track_type: str = "track",
+    volume_db: float | None = None,
+    pan: float | None = None,
+    sends_db: Dict[str, float] | None = None,
+    mute: bool | None = None,
+    solo: bool | None = None,
+    arm: bool | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Set a track's fader, pan, send levels, mute, solo or arm in one call.
+
+    Only the arguments you pass change. Works on tracks, return tracks and
+    the master.
+
+    Parameters:
+    - track_index: Track index within its track_type (ignored for master)
+    - track_type: "track" (default), "return" or "master"
+    - volume_db: Fader level in dB, e.g. -6.0 (0 = unity, max +6, -70 or lower = -inf)
+    - pan: -1.0 (hard left) to 1.0 (hard right), 0 = center
+    - sends_db: Send levels in dB keyed by return letter or index,
+      e.g. {"A": -12, "B": -18}; -70 or lower = off
+    - mute / solo: Mute or solo the track (not available on master)
+    - arm: Arm the track for recording
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        uses_display = volume_db is not None or bool(sends_db)
+        missing = _missing_features(
+            track_type, display_value="" if uses_display else None)
+        if missing:
+            return missing
+        base: Dict[str, Any] = {"track_index": track_index}
+        if track_type != "track":
+            base["track_type"] = track_type
+        changes = []
+        if volume_db is not None:
+            r = _send("set_mixer_value", {**base, "target": "volume",
+                                          "display_value": _volume_display(volume_db)})
+            if isinstance(r, str):
+                return r
+            changes.append(f"volume {r.get('old_display')} → {r.get('display')}")
+        if pan is not None:
+            r = _send("set_mixer_value", {**base, "target": "panning",
+                                          "value": max(-1.0, min(1.0, float(pan)))})
+            if isinstance(r, str):
+                return r
+            changes.append(f"pan {r.get('old_display')} → {r.get('display')}")
+        for key, db in (sends_db or {}).items():
+            index = _send_index(key)
+            r = _send("set_mixer_value", {**base, "target": "send", "send_index": index,
+                                          "display_value": _volume_display(db)})
+            if isinstance(r, str):
+                return r
+            changes.append(
+                f"send {chr(ord('A') + index)} {r.get('old_display')} → {r.get('display')}")
+        if mute is not None or solo is not None or arm is not None:
+            state = {k: v for k, v in (("mute", mute), ("solo", solo), ("arm", arm))
+                     if v is not None}
+            r = _send("set_track_state", {**base, **state})
+            if isinstance(r, str):
+                return r
+            changes.extend(f"{k} {v}" for k, v in r.items())
+        if not changes:
+            return "Nothing to change: pass volume_db, pan, sends_db, mute, solo or arm"
+        where = "master" if track_type == "master" else f"{track_type} {track_index}"
+        return f"{where}: " + "; ".join(changes)
+    except Exception as e:
+        logger.error(f"Error setting mixer: {str(e)}")
+        return f"Error setting mixer: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("get_meters")
+@trajectory_tool("get_meters", modifying=False)
+def get_meters(ctx: Context, seconds: float = 2.0, user_prompt: str = "") -> str:
+    """
+    Sample output meters on every track, return and master while Live plays.
+
+    Reports peak and average per track on Live's meter scale (0..1, 1.0 =
+    full scale; not linear amplitude). Use it to compare levels between
+    tracks and to check the master for clipping. Start playback first.
+
+    Parameters:
+    - seconds: How long to listen, 0.1–10 (default 2)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _send("get_meters", {"seconds": seconds})
+        if isinstance(result, str):
+            return result
+        rows = []
+        if not result.get("is_playing"):
+            rows.append("Warning: Live is not playing, so meters read silence.")
+        for m in result.get("meters", []):
+            name = "master" if m["track_type"] == "master" else (
+                f"{'return ' if m['track_type'] == 'return' else ''}{m['index']} {m['name']}")
+            rows.append(f"{name}: peak {m['peak']:.3f}, avg {m['average']:.3f}")
+        rows.append(f"({result.get('scale')}; sampled {result.get('seconds')} s)")
+        return "\n".join(rows)
+    except Exception as e:
+        logger.error(f"Error reading meters: {str(e)}")
+        return f"Error reading meters: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("get_track_routing")
+@trajectory_tool("get_track_routing", modifying=False)
+def get_track_routing(
+    ctx: Context, track_index: int, track_type: str = "track", user_prompt: str = ""
+) -> str:
+    """
+    Read a track's input/output routing and the options available for each.
+
+    Parameters:
+    - track_index: Track index within its track_type
+    - track_type: "track" (default), "return" or "master"
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        missing = _missing_features(track_type)
+        if missing:
+            return missing
+        params: Dict[str, Any] = {"track_index": track_index}
+        if track_type != "track":
+            params["track_type"] = track_type
+        result = _send("get_track_routing", params)
+        return result if isinstance(result, str) else _compact_json(result)
+    except Exception as e:
+        logger.error(f"Error getting track routing: {str(e)}")
+        return f"Error getting track routing: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("set_track_routing")
+@trajectory_tool("set_track_routing")
+def set_track_routing(
+    ctx: Context,
+    track_index: int,
+    direction: str,
+    type_name: str = "",
+    channel_name: str = "",
+    track_type: str = "track",
+    user_prompt: str = "",
+) -> str:
+    """
+    Route a track's input or output, e.g. feed a track from another track.
+
+    Names match the options get_track_routing lists (exact, then substring,
+    case-insensitive). Device sidechain inputs (Compressor, Gate) are not
+    reachable yet; use routing to build a resampling or ghost-trigger track.
+
+    Parameters:
+    - track_index: Track index within its track_type
+    - direction: "input" or "output"
+    - type_name: Routing type, e.g. "Kick", "Ext. In", "Master", "Sends Only"
+    - channel_name: Channel within that type, e.g. "Post FX", "Pre FX", "1/2"
+    - track_type: "track" (default), "return" or "master"
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        extra = ["routing_channels"] if channel_name else []
+        missing = _missing_features(track_type, extra=extra)
+        if missing:
+            return missing
+        params: Dict[str, Any] = {
+            "track_index": track_index, "direction": direction, "type_name": type_name,
+        }
+        if channel_name:
+            params["channel_name"] = channel_name
+        if track_type != "track":
+            params["track_type"] = track_type
+        result = _send("set_track_routing", params)
+        return result if isinstance(result, str) else _compact_json(result)
+    except Exception as e:
+        logger.error(f"Error setting track routing: {str(e)}")
+        return f"Error setting track routing: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("delete_device")
+@trajectory_tool("delete_device")
+def delete_device(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    track_type: str = "track",
+    chain_path: List[int] | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Delete a device from a track, or from inside a rack via chain_path.
+
+    Parameters:
+    - track_index: Track index within its track_type
+    - device_index: Index into the track's device chain
+    - track_type: "track" (default), "return" or "master"
+    - chain_path: [chain_index, device_index, ...] pairs to reach a nested device
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        missing = _missing_features(track_type, chain_path)
+        if missing:
+            return missing
+        params: Dict[str, Any] = {"track_index": track_index, "device_index": device_index}
+        if track_type != "track":
+            params["track_type"] = track_type
+        if chain_path:
+            params["chain_path"] = chain_path
+        result = _send("delete_device", params)
+        if isinstance(result, str):
+            return result
+        remaining = ", ".join(f"{i}:{n}" for i, n in enumerate(result.get("devices", [])))
+        return f"Deleted {result.get('deleted')}. Devices now: {remaining or 'none'}"
+    except Exception as e:
+        logger.error(f"Error deleting device: {str(e)}")
+        return f"Error deleting device: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("move_device")
+@trajectory_tool("move_device")
+def move_device(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    new_index: int,
+    track_type: str = "track",
+    chain_path: List[int] | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Reorder a device within its track (or rack chain).
+
+    Parameters:
+    - track_index: Track index within its track_type
+    - device_index: Current index of the device
+    - new_index: Index it should end up at
+    - track_type: "track" (default), "return" or "master"
+    - chain_path: [chain_index, device_index, ...] pairs to reach a nested device
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        missing = _missing_features(track_type, chain_path)
+        if missing:
+            return missing
+        params: Dict[str, Any] = {
+            "track_index": track_index, "device_index": device_index, "new_index": new_index,
+        }
+        if track_type != "track":
+            params["track_type"] = track_type
+        if chain_path:
+            params["chain_path"] = chain_path
+        result = _send("move_device", params)
+        if isinstance(result, str):
+            return result
+        order = ", ".join(f"{i}:{n}" for i, n in enumerate(result.get("devices", [])))
+        return f"Moved {result.get('moved')}. Devices now: {order}"
+    except Exception as e:
+        logger.error(f"Error moving device: {str(e)}")
+        return f"Error moving device: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("delete_track")
+@trajectory_tool("delete_track")
+def delete_track(ctx: Context, track_index: int, user_prompt: str = "") -> str:
+    """
+    Delete a track and everything on it. Undo with undo if it was a mistake.
+
+    Parameters:
+    - track_index: Index of the track to delete
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _send("delete_track", {"track_index": track_index})
+        return result if isinstance(result, str) else _compact_json(result)
+    except Exception as e:
+        logger.error(f"Error deleting track: {str(e)}")
+        return f"Error deleting track: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("fire_scene")
+@trajectory_tool("fire_scene", modifying=False)
+def fire_scene(ctx: Context, index: int, user_prompt: str = "") -> str:
+    """
+    Launch every clip in a scene (a row of the Session view).
+
+    Parameters:
+    - index: Scene index
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _send("fire_scene", {"index": index})
+        return result if isinstance(result, str) else f"Fired scene {index}"
+    except Exception as e:
+        logger.error(f"Error firing scene: {str(e)}")
+        return f"Error firing scene: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("create_scene")
+@trajectory_tool("create_scene")
+def create_scene(ctx: Context, index: int = -1, user_prompt: str = "") -> str:
+    """
+    Insert an empty scene.
+
+    Parameters:
+    - index: Where to insert it (-1 = end)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _send("create_scene", {"index": index})
+        return result if isinstance(result, str) else _compact_json(result)
+    except Exception as e:
+        logger.error(f"Error creating scene: {str(e)}")
+        return f"Error creating scene: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("delete_scene")
+@trajectory_tool("delete_scene")
+def delete_scene(ctx: Context, index: int, user_prompt: str = "") -> str:
+    """
+    Delete a scene and the clips in its row.
+
+    Parameters:
+    - index: Scene index
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _send("delete_scene", {"index": index})
+        return result if isinstance(result, str) else _compact_json(result)
+    except Exception as e:
+        logger.error(f"Error deleting scene: {str(e)}")
+        return f"Error deleting scene: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("undo")
+@trajectory_tool("undo", modifying=False)
+def undo(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Undo the last change in Live (same as Cmd/Ctrl+Z).
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _send("undo")
+        return result if isinstance(result, str) else _compact_json(result)
+    except Exception as e:
+        logger.error(f"Error undoing: {str(e)}")
+        return f"Error undoing: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("redo")
+@trajectory_tool("redo", modifying=False)
+def redo(ctx: Context, user_prompt: str = "") -> str:
+    """
+    Redo the last undone change in Live.
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _send("redo")
+        return result if isinstance(result, str) else _compact_json(result)
+    except Exception as e:
+        logger.error(f"Error redoing: {str(e)}")
+        return f"Error redoing: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("create_clip_automation")
+@trajectory_tool("create_clip_automation")
+def create_clip_automation(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    device_index: int,
+    parameter_index: int,
+    points: List[Dict[str, float]],
+    user_prompt: str = "",
+) -> str:
+    """
+    Write a clip envelope for a device parameter in a Session clip.
+
+    The envelope loops with the clip, which suits filter sweeps, delay
+    throws and slow movement across a long loop. Ramps between points are
+    written as 1/16-note steps. Applies to top-level devices on regular
+    tracks only.
+
+    Parameters:
+    - track_index: Track that owns the clip and the device
+    - clip_index: Session clip slot
+    - device_index: Device on the track
+    - parameter_index: Parameter on that device (see get_device_parameters)
+    - points: At least 2 points [{"time": beats_from_clip_start, "value": raw_value}],
+      sorted by time; values in the parameter's raw min..max range
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _send("create_automation", {
+            "track_index": track_index, "clip_index": clip_index,
+            "device_index": device_index, "parameter_index": parameter_index,
+            "points": points,
+        })
+        return result if isinstance(result, str) else _compact_json(result)
+    except Exception as e:
+        logger.error(f"Error creating automation: {str(e)}")
+        return f"Error creating automation: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("update_notes")
+@trajectory_tool("update_notes")
+def update_notes(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    notes: List[Dict[str, Any]],
+    user_prompt: str = "",
+) -> str:
+    """
+    Edit existing notes in place by note_id, leaving every other note alone.
+
+    Read note_ids with get_clip_notes. Each note needs note_id plus the
+    fields to change: pitch, start_time, duration, velocity, mute,
+    probability, velocity_deviation.
+
+    Parameters:
+    - track_index: Track that owns the clip
+    - clip_index: Session clip slot
+    - notes: Notes to modify, each with its note_id
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _send("update_notes", {
+            "track_index": track_index, "clip_index": clip_index, "notes": notes,
+        })
+        return result if isinstance(result, str) else _compact_json(result)
+    except Exception as e:
+        logger.error(f"Error updating notes: {str(e)}")
+        return f"Error updating notes: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("remove_notes")
+@trajectory_tool("remove_notes")
+def remove_notes(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    from_time: float = 0.0,
+    time_span: float = 128.0,
+    from_pitch: int = 0,
+    pitch_span: int = 128,
+    user_prompt: str = "",
+) -> str:
+    """
+    Remove the notes inside a time and pitch window, keeping the rest.
+
+    Parameters:
+    - track_index: Track that owns the clip
+    - clip_index: Session clip slot
+    - from_time: Window start in beats
+    - time_span: Window length in beats
+    - from_pitch: Lowest MIDI pitch to remove
+    - pitch_span: Number of pitches upward from from_pitch
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _send("remove_notes_range", {
+            "track_index": track_index, "clip_index": clip_index,
+            "from_time": from_time, "time_span": time_span,
+            "from_pitch": from_pitch, "pitch_span": pitch_span,
+        })
+        return result if isinstance(result, str) else _compact_json(result)
+    except Exception as e:
+        logger.error(f"Error removing notes: {str(e)}")
+        return f"Error removing notes: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("set_clip_launch_settings")
+@trajectory_tool("set_clip_launch_settings")
+def set_clip_launch_settings(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    quantization: int | None = None,
+    legato: bool | None = None,
+    follow_action_a: int | None = None,
+    follow_action_b: int | None = None,
+    follow_action_time: float | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Set a Session clip's launch quantization, legato and follow actions.
+
+    Follow actions let clip variations alternate on their own, which is how
+    a long set evolves without new clips.
+
+    Parameters:
+    - track_index: Track that owns the clip
+    - clip_index: Session clip slot
+    - quantization: Live's launch quantization enum (0 = global)
+    - legato: Legato mode on/off
+    - follow_action_a / follow_action_b: Live follow action enums
+    - follow_action_time: Beats before the follow action fires
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        settings = {k: v for k, v in (
+            ("quantization", quantization), ("legato", legato),
+            ("follow_action_a", follow_action_a), ("follow_action_b", follow_action_b),
+            ("follow_action_time", follow_action_time),
+        ) if v is not None}
+        result = _send("set_clip_launch_settings", {
+            "track_index": track_index, "clip_index": clip_index, **settings,
+        })
+        return result if isinstance(result, str) else _compact_json(result)
+    except Exception as e:
+        logger.error(f"Error setting clip launch settings: {str(e)}")
+        return f"Error setting clip launch settings: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("get_groove_pool")
+@trajectory_tool("get_groove_pool", modifying=False)
+def get_groove_pool(ctx: Context, user_prompt: str = "") -> str:
+    """
+    List the grooves in the project's groove pool.
+
+    Parameters:
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _send("get_groove_pool")
+        return result if isinstance(result, str) else _compact_json(result)
+    except Exception as e:
+        logger.error(f"Error reading groove pool: {str(e)}")
+        return f"Error reading groove pool: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("set_clip_groove")
+@trajectory_tool("set_clip_groove")
+def set_clip_groove(
+    ctx: Context, track_index: int, clip_index: int, groove_index: int, user_prompt: str = ""
+) -> str:
+    """
+    Apply a groove from the groove pool to a Session clip (swing, shuffle).
+
+    Parameters:
+    - track_index: Track that owns the clip
+    - clip_index: Session clip slot
+    - groove_index: Index from get_groove_pool
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _send("set_clip_groove", {
+            "track_index": track_index, "clip_index": clip_index, "groove_index": groove_index,
+        })
+        return result if isinstance(result, str) else _compact_json(result)
+    except Exception as e:
+        logger.error(f"Error setting clip groove: {str(e)}")
+        return f"Error setting clip groove: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("search_browser")
+@trajectory_tool("search_browser", modifying=False)
+def search_browser(
+    ctx: Context,
+    query: str,
+    category: str = "all",
+    limit: int = 20,
+    loadable_only: bool = True,
+    refresh: bool = False,
+    user_prompt: str = "",
+) -> str:
+    """
+    Find instruments, effects, presets and kits in Live's browser by name.
+
+    Every word in query must appear in the item's name or folder path.
+    Returns name, path and URI; pass the URI to load_instrument_or_effect.
+    The first search of each browser section takes a few seconds while it is
+    indexed; later searches are instant.
+
+    Parameters:
+    - query: Words to match, e.g. "dub chord", "909 kit", "echo"
+    - category: "all" (default: instruments, sounds, drums, audio_effects,
+      midi_effects, max_for_live, plugins, user_library) or one browser
+      section, including "packs" or "samples"
+    - limit: Maximum results (default 20, max 200)
+    - loadable_only: Skip folders (default True)
+    - refresh: Rebuild the index (after installing packs or saving presets)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        result = _send("search_browser", {
+            "query": query, "category": category, "limit": limit,
+            "loadable_only": loadable_only, "refresh": refresh,
+        })
+        if isinstance(result, str):
+            return result
+        rows = [f"{r['name']} — {r['path']} — {r['uri']}" for r in result.get("results", [])]
+        header = (f"{result.get('total_matches', 0)} matches for '{query}'"
+                  f" (showing {len(rows)})")
+        if result.get("truncated_roots"):
+            header += f"; index truncated in {', '.join(result['truncated_roots'])}"
+        return "\n".join([header] + rows)
+    except Exception as e:
+        logger.error(f"Error searching browser: {str(e)}")
+        return f"Error searching browser: {str(e)}"
 
 
 # Main execution

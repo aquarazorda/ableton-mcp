@@ -38,6 +38,18 @@ MODIFYING_TOOLS = {
     "load_instrument_or_effect",
     "load_drum_kit",
     "duplicate_to_arrangement",
+    "set_mixer",
+    "delete_device",
+    "move_device",
+    "delete_track",
+    "set_track_routing",
+    "create_clip_automation",
+    "update_notes",
+    "remove_notes",
+    "set_clip_launch_settings",
+    "set_clip_groove",
+    "create_scene",
+    "delete_scene",
 }
 
 _PARAM_KEYS = (

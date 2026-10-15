@@ -1,6 +1,6 @@
 # AbletonMCP capability map
 
-Living audit of what this Remote Script (`__init__.py`, currently v1.13.0)
+Living audit of what this Remote Script (`__init__.py`, currently v1.19.0)
 can and can't do. Started 2026-09-19 after a session of live-testing,
 patching, and root-causing real bugs against Live 12.4.6 — not a spec, a
 record of what was actually verified working, kept honest about the
@@ -154,6 +154,34 @@ verification, good or bad.
 - **Return-track device loading** (`target="return"`) — only Master was
   tested; the code path is identical but return-track indexing is
   unverified.
+
+### v1.19.0 — unit-tested against fakes, not yet run in Live
+
+Driven by `docs/mcp-gap-report.md`. Each item has tests in
+`tests/test_live_surface.py`, but those use a fake song, so the Live API
+assumptions below are the parts to check first after a restart:
+
+- **`track_type` on device, mixer, state and routing commands**
+  (`"track"`, `"return"`, `"master"`), via `_resolve_track`.
+- **`chain_path`** (`[chain, device, …]` pairs) on get/set parameter,
+  delete and move, for devices inside racks. Assumes `Chain.delete_device`
+  exists.
+- **Display values:** parameters report `display` (`str_for_value`) and
+  `value_items`; `display_value` sets by bisecting `str_for_value`.
+  Assumes Live's display strings are monotonic for continuous parameters.
+- **Drum pad notes:** `drum_pads` from `DrumChain.in_note` (Live 12),
+  falling back to `DrumPad.note` / `DrumPad.chains`.
+- **`include_chains=False` / `name_filter`** on `get_device_parameters`.
+- **`move_device`** and load `position`, via `Song.move_device`. Whether
+  its position counts the vacated slot isn't documented; the script
+  checks where the device landed and corrects once.
+- **`get_mixer`** (with display strings) and **`get_meters`**
+  (`output_meter_left/right`, sampled off the main thread).
+- **`search_browser`** (cached flat index per browser root) and
+  `offset`/`limit` paging on `get_browser_items_at_path`.
+- **Routing channels:** `channel_name` on `set_track_routing`.
+- Removed the dispatch for `get_browser_categories` / `get_browser_items`,
+  whose handlers never existed.
 
 ## Genuinely inconclusive — needs a clean re-test
 

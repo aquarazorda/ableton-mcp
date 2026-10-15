@@ -264,8 +264,11 @@ Once the config file has been set on Claude, and the remote script is running in
 - Create full song arrangements from start to finish in Arrangement View
 - Create, edit, and trigger clips
 - Control playback
-- Load instruments and effects from Ableton's browser
-- Add notes to MIDI clips
+- Load instruments and effects from Ableton's browser, search it by name, and place, move or delete devices
+- Add, edit and remove notes in MIDI clips
+- Mix: volume, pan, sends, mute and solo on tracks, returns and the master, plus output meters
+- Set any device parameter by the value Live displays ("180 Hz", "-6 dB"), including devices inside racks
+- Read drum rack pad notes, and write clip automation envelopes
 - Change tempo and other session parameters
 
 ### Example Commands
