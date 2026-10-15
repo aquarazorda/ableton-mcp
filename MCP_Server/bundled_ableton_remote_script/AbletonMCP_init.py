@@ -35,7 +35,7 @@ MAX_REQUEST_BYTES = 16 * 1024 * 1024
 
 # Bumped whenever the TCP command surface changes; the MCP server compares
 # this to EXPECTED_REMOTE_SCRIPT_VERSION.
-SCRIPT_VERSION = "1.19.0"
+SCRIPT_VERSION = "1.20.0"
 PROTOCOL_VERSION = 1
 
 SCRIPT_CAPABILITIES = [
@@ -91,6 +91,11 @@ SCRIPT_CAPABILITIES = [
     "move_device",
     "search_browser",
     "get_meters",
+    "set_clip_loop",
+    "create_arrangement_automation",
+    "get_automation",
+    "get_device_sidechain",
+    "set_device_sidechain",
     # Parameter features rather than commands, so the server can refuse
     # instead of sending them to an older script that would ignore them.
     "track_type",
@@ -98,6 +103,8 @@ SCRIPT_CAPABILITIES = [
     "display_value",
     "browser_paging",
     "routing_channels",
+    # mixer_target / chain_path / display points on create_automation
+    "automation_targets",
 ]
 
 def create_instance(c_instance):
@@ -351,7 +358,9 @@ class AbletonMCP(ControlSurface):
                                  "update_notes", "remove_notes_range",
                                  "add_warp_marker", "remove_warp_marker",
                                  "move_warp_marker", "select_notes",
-                                 "create_take_lane", "move_device"]:
+                                 "create_take_lane", "move_device",
+                                 "set_clip_loop", "create_arrangement_automation",
+                                 "set_device_sidechain"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -462,14 +471,42 @@ class AbletonMCP(ControlSurface):
                             self._create_locator(name, time_val, response_queue)
                             return
                         elif command_type == "create_automation":
-                            track_index = params.get("track_index", 0)
-                            clip_index = params.get("clip_index", 0)
-                            device_index = params.get("device_index", 0)
-                            parameter_index = params.get("parameter_index", 0)
-                            points = params.get("points", [])
                             result = self._create_automation(
-                                track_index, clip_index, device_index,
-                                parameter_index, points)
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                params.get("device_index", 0),
+                                params.get("parameter_index", 0),
+                                params.get("points", []),
+                                **self._automation_target_params(params))
+                        elif command_type == "create_arrangement_automation":
+                            target = self._automation_target_params(params)
+                            target.pop("clear", None)
+                            result = self._create_arrangement_automation(
+                                params.get("track_index", 0),
+                                params.get("points", []),
+                                device_index=params.get("device_index", None),
+                                parameter_index=params.get("parameter_index", None),
+                                track_type=params.get("track_type", "track"),
+                                **target)
+                        elif command_type == "set_clip_loop":
+                            result = self._set_clip_loop(
+                                params.get("track_index", 0),
+                                params.get("clip_index", 0),
+                                loop_start=params.get("loop_start", None),
+                                loop_end=params.get("loop_end", None),
+                                length=params.get("length", None),
+                                looping=params.get("looping", None))
+                        elif command_type == "set_device_sidechain":
+                            result = self._set_device_sidechain(
+                                params.get("track_index", 0),
+                                params.get("device_index", 0),
+                                source=params.get("source", None),
+                                source_track_index=params.get("source_track_index", None),
+                                source_track_type=params.get("source_track_type", "track"),
+                                channel_name=params.get("channel_name", None),
+                                enable=params.get("enable", True),
+                                track_type=params.get("track_type", "track"),
+                                chain_path=params.get("chain_path", None))
                         elif command_type == "delete_device":
                             track_index = params.get("track_index", 0)
                             device_index = params.get("device_index", 0)
@@ -673,6 +710,25 @@ class AbletonMCP(ControlSurface):
                 response["result"] = self._get_arrangement_clips(track_index)
             elif command_type == "get_groove_pool":
                 response["result"] = self._get_groove_pool()
+            elif command_type == "get_automation":
+                target = self._automation_target_params(params)
+                target.pop("clear", None)
+                response["result"] = self._get_automation(
+                    params.get("track_index", 0),
+                    clip_index=params.get("clip_index", None),
+                    device_index=params.get("device_index", None),
+                    parameter_index=params.get("parameter_index", None),
+                    track_type=params.get("track_type", "track"),
+                    start=params.get("start", None),
+                    end=params.get("end", None),
+                    step=params.get("step", 1.0),
+                    **target)
+            elif command_type == "get_device_sidechain":
+                response["result"] = self._get_device_sidechain(
+                    params.get("track_index", 0),
+                    params.get("device_index", 0),
+                    track_type=params.get("track_type", "track"),
+                    chain_path=params.get("chain_path", None))
             elif command_type == "investigate_render_capability":
                 track_index = params.get("track_index", 0)
                 response["result"] = self._investigate_render_capability(track_index)
@@ -1306,6 +1362,57 @@ class AbletonMCP(ControlSurface):
             return {"target": target, "color": int(obj.color)}
         except Exception as e:
             self.log_message("Error setting color: " + str(e))
+            self.log_message(traceback.format_exc())
+            raise
+
+    def _set_clip_loop(self, track_index, clip_index, loop_start=None, loop_end=None,
+                       length=None, looping=None):
+        """Set a Session clip's loop (or, unlooped, its start and end).
+
+        Clip.length is read-only in Live, so length moves loop_end to
+        loop_start + length. Live rejects a loop_start at or past the
+        current loop_end (and the reverse), so the two are written in
+        whichever order keeps the loop valid at every step. Times are in
+        beats; unwarped audio clips use seconds.
+        """
+        try:
+            track = self._resolve_track(track_index, "track")
+            if clip_index < 0 or clip_index >= len(track.clip_slots):
+                raise IndexError("Clip index out of range")
+            slot = track.clip_slots[clip_index]
+            if not slot.has_clip:
+                raise Exception("No clip in that slot")
+            clip = slot.clip
+            if loop_end is not None and length is not None:
+                raise ValueError("Pass loop_end or length, not both")
+            if looping is not None:
+                clip.looping = bool(looping)
+            start = float(clip.loop_start if loop_start is None else loop_start)
+            if length is not None:
+                end = start + float(length)
+            elif loop_end is not None:
+                end = float(loop_end)
+            else:
+                end = float(clip.loop_end)
+            if end <= start:
+                raise ValueError(
+                    "Loop end (%g) must be after loop start (%g)" % (end, start))
+            if start >= float(clip.loop_end):
+                clip.loop_end = end
+                clip.loop_start = start
+            else:
+                clip.loop_start = start
+                clip.loop_end = end
+            return {
+                "loop_start": float(clip.loop_start),
+                "loop_end": float(clip.loop_end),
+                "length": float(clip.length),
+                "looping": bool(clip.looping),
+                "start_marker": float(clip.start_marker),
+                "end_marker": float(clip.end_marker),
+            }
+        except Exception as e:
+            self.log_message("Error setting clip loop: " + str(e))
             self.log_message(traceback.format_exc())
             raise
 
@@ -2249,108 +2356,454 @@ class AbletonMCP(ControlSurface):
                 device, container, new_index + (1 if landed < new_index else 0))
         return self._device_position(device, container)
 
-    def _create_automation(self, track_index, clip_index, device_index, parameter_index, points):
-        """Write an automation envelope for a device parameter into a Session clip.
+    # ── Automation ────────────────────────────────────────────────────────────
 
-        points: list of {"time": beats_from_clip_start, "value": native_param_value},
-        at least 2 points, sorted by time. The LOM's envelope API is step-based
-        (insert_step) rather than true curves, so a ramp between two points is
-        approximated as many short constant-value steps (one per 16th note,
-        capped at 64 substeps per segment).
+    def _automation_target_params(self, params):
+        return {
+            "chain_path": params.get("chain_path", None),
+            "mixer_target": params.get("mixer_target", None),
+            "send_index": params.get("send_index", None),
+            "clear": params.get("clear", True),
+        }
 
-        Best-effort implementation: the exact AutomationEnvelope method surface
-        isn't confirmed against this Live version yet. If insert_step's
-        signature doesn't match, this logs the real object's available methods
-        (dir(envelope)) to Live's Log.txt so the call can be corrected in one
-        follow-up pass instead of guessing blind.
+    _AUTOMATION_STATES = {0: "none", 1: "playing", 2: "overridden"}
+
+    def _automation_param(self, track, device_index=None, parameter_index=None,
+                          chain_path=None, mixer_target=None, send_index=None):
+        """The DeviceParameter an automation command targets.
+
+        mixer_target ("volume", "panning", "send" + send_index) picks a
+        mixer parameter; otherwise device_index/parameter_index (and
+        chain_path for rack devices) pick a device parameter.
+        """
+        if mixer_target:
+            mixer = track.mixer_device
+            if mixer_target == "volume":
+                return mixer.volume
+            if mixer_target in ("panning", "pan"):
+                return mixer.panning
+            if mixer_target == "send":
+                if send_index is None:
+                    raise ValueError("send_index is required when mixer_target is 'send'")
+                send_index = int(send_index)
+                if send_index < 0 or send_index >= len(mixer.sends):
+                    raise IndexError("Send index out of range")
+                return mixer.sends[send_index]
+            raise ValueError(
+                "Unknown mixer_target '%s' (expected volume, panning or send)"
+                % mixer_target)
+        if device_index is None or parameter_index is None:
+            raise ValueError("Pass device_index and parameter_index, or mixer_target")
+        device = self._resolve_device(track, device_index, chain_path)
+        if parameter_index < 0 or parameter_index >= len(device.parameters):
+            raise IndexError("Parameter index out of range")
+        return device.parameters[parameter_index]
+
+    def _automation_points(self, param, points):
+        """Sorted (time, value) pairs, clamped to the parameter's range.
+
+        A point gives either a raw "value" or a "display" string ("-6 dB",
+        "800 Hz") resolved the same way set_device_parameter does.
+        """
+        if not points or len(points) < 2:
+            raise ValueError("Need at least 2 points (time, value) to write an envelope")
+        lo, hi = float(param.min), float(param.max)
+        resolved = []
+        for p in points:
+            if p.get("display") is not None:
+                value = self._value_for_display(param, p["display"])
+            elif p.get("value") is not None:
+                value = float(p["value"])
+            else:
+                raise ValueError("Each point needs a value or a display")
+            resolved.append((float(p["time"]), max(lo, min(hi, value))))
+        resolved.sort(key=lambda tv: tv[0])
+        if resolved[-1][0] <= resolved[0][0]:
+            raise ValueError("Points must span a positive length of time")
+        return resolved
+
+    def _write_envelope(self, envelope, points, offset=0.0, lo=None, hi=None):
+        """Insert ``points`` into ``envelope`` as constant steps.
+
+        Point times minus ``offset`` give envelope times. Only the part of
+        the ramp inside [lo, hi) (point time) is written, so one ramp can
+        be split across several arrangement clips. The envelope API is
+        step-based, so a ramp is written as one step per 16th note (at most
+        64 per segment), and the last point gets a short step of its own so
+        the envelope reaches its final value.
+
+        Returns (steps_inserted, error_or_None).
+        """
+        lo = points[0][0] if lo is None else lo
+        hi = points[-1][0] + 0.25 if hi is None else hi
+        steps = []
+        for (t0, v0), (t1, v1) in zip(points, points[1:]):
+            span = t1 - t0
+            if span <= 0:
+                continue
+            substeps = max(1, min(64, int(span / 0.25)))
+            step_len = span / substeps
+            for s in range(substeps):
+                frac = s / float(substeps)
+                steps.append((t0 + s * step_len, step_len, v0 + (v1 - v0) * frac))
+        steps.append((points[-1][0], 0.25, points[-1][1]))
+        inserted = 0
+        for t, length, value in steps:
+            if t < lo or t >= hi:
+                continue
+            length = min(length, hi - t)
+            try:
+                envelope.insert_step(t - offset, length, value)
+                inserted += 1
+            except Exception as e:
+                return inserted, str(e)
+        return inserted, None
+
+    def _clip_envelope(self, clip, param, create=False):
+        """The clip's envelope for ``param``, creating it when asked.
+
+        automation_envelope() only reads an existing envelope;
+        create_automation_envelope() makes one.
+        """
+        envelope = clip.automation_envelope(param)
+        if envelope is None and create:
+            envelope = clip.create_automation_envelope(param)
+        return envelope
+
+    def _create_automation(self, track_index, clip_index, device_index=None,
+                           parameter_index=None, points=None, chain_path=None,
+                           mixer_target=None, send_index=None, clear=True):
+        """Write an automation envelope into a Session clip.
+
+        points: [{"time": beats_from_clip_start, "value": raw} or
+        {"time": ..., "display": "-6 dB"}], at least 2. The target is a
+        device parameter (device_index/parameter_index, chain_path for rack
+        devices) or a mixer parameter of the same track (mixer_target:
+        volume, panning or send with send_index). clear removes the
+        parameter's existing envelope in this clip first.
         """
         try:
-            if track_index < 0 or track_index >= len(self._song.tracks):
-                raise IndexError("Track index out of range")
-            track = self._song.tracks[track_index]
-
+            track = self._resolve_track(track_index, "track")
             if clip_index < 0 or clip_index >= len(track.clip_slots):
                 raise IndexError("Clip index out of range")
             clip_slot = track.clip_slots[clip_index]
             if not clip_slot.has_clip:
                 raise Exception("No clip in that slot to attach automation to")
             clip = clip_slot.clip
+            param = self._automation_param(
+                track, device_index, parameter_index, chain_path,
+                mixer_target, send_index)
+            pts = self._automation_points(param, points)
 
-            if device_index < 0 or device_index >= len(track.devices):
-                raise IndexError("Device index out of range")
-            device = track.devices[device_index]
-
-            if parameter_index < 0 or parameter_index >= len(device.parameters):
-                raise IndexError("Parameter index out of range")
-            param = device.parameters[parameter_index]
-
-            if not points or len(points) < 2:
-                raise Exception("Need at least 2 points (time, value) to write an envelope")
-
-            self.log_message(
-                "create_automation: param=" + str(param.name) +
-                " is_enabled=" + str(getattr(param, "is_enabled", "?")) +
-                " automation_state=" + str(getattr(param, "automation_state", "?"))
-            )
-
-            envelope = clip.automation_envelope(param)
-            if envelope is None:
-                # No envelope exists yet for this parameter on this clip —
-                # automation_envelope() only reads, create_automation_envelope()
-                # actually creates one.
-                envelope = clip.create_automation_envelope(param)
+            if clear:
+                try:
+                    clip.clear_envelope(param)
+                except Exception as e:
+                    self.log_message("create_automation: clear_envelope failed (continuing): " + str(e))
+            envelope = self._clip_envelope(clip, param, create=True)
             if envelope is None:
                 raise Exception(
-                    "clip.create_automation_envelope(param) also returned None for "
-                    "parameter '" + str(param.name) + "' — parameter may not be "
-                    "automatable at all."
-                )
+                    "Live returned no envelope for '%s'; the parameter may not "
+                    "be automatable" % param.name)
 
-            self.log_message(
-                "create_automation: envelope acquired, available attrs: " +
-                str([a for a in dir(envelope) if not a.startswith("_")])
-            )
-
-            try:
-                envelope.clear_envelope()
-            except Exception as e:
-                self.log_message("create_automation: clear_envelope failed (continuing): " + str(e))
-
-            points_sorted = sorted(points, key=lambda p: float(p["time"]))
-            inserted = 0
-            last_error = None
-
-            for i in range(len(points_sorted) - 1):
-                t0 = float(points_sorted[i]["time"])
-                v0 = float(points_sorted[i]["value"])
-                t1 = float(points_sorted[i + 1]["time"])
-                v1 = float(points_sorted[i + 1]["value"])
-                span = t1 - t0
-                if span <= 0:
-                    continue
-                substeps = max(1, min(64, int(span / 0.25)))
-                step_len = span / substeps
-                for s in range(substeps):
-                    t = t0 + s * step_len
-                    frac = s / float(substeps)
-                    v = v0 + (v1 - v0) * frac
-                    try:
-                        envelope.insert_step(t, step_len, v)
-                        inserted += 1
-                    except Exception as e:
-                        last_error = str(e)
-                        break
-                if last_error:
-                    break
-
+            inserted, error = self._write_envelope(envelope, pts)
             result = {"inserted_steps": inserted, "parameter": param.name}
-            if last_error:
-                result["error"] = last_error
+            if error:
+                result["error"] = error
                 result["envelope_attrs"] = [a for a in dir(envelope) if not a.startswith("_")]
-                self.log_message("create_automation: insert_step failed: " + last_error)
+                self.log_message("create_automation: insert_step failed: " + error)
             return result
         except Exception as e:
             self.log_message("Error creating automation: " + str(e))
+            self.log_message(traceback.format_exc())
+            raise
+
+    def _arrangement_window(self, clip, lo, hi):
+        """Clip the song-time span [lo, hi) to what ``clip`` plays once.
+
+        Returns (lo, hi, offset) where song_time - offset is clip time, or
+        None when the clip doesn't overlap. A looped clip repeats its
+        envelope, so only its first pass is writable.
+        """
+        c0, c1 = float(clip.start_time), float(clip.end_time)
+        offset = c0 - float(clip.start_marker)
+        if getattr(clip, "looping", False):
+            c1 = min(c1, float(clip.loop_end) + offset)
+        lo, hi = max(lo, c0), min(hi, c1)
+        if hi <= lo:
+            return None
+        return lo, hi, offset
+
+    def _create_arrangement_automation(self, track_index, points, device_index=None,
+                                       parameter_index=None, chain_path=None,
+                                       mixer_target=None, send_index=None,
+                                       track_type="track"):
+        """Write automation over a span of the Arrangement, in song beats.
+
+        Live's API gives Remote Scripts no handle on a track's arrangement
+        automation lane, so this writes the envelope of each arrangement
+        clip under the span instead. Spans with no clip, and clips Live
+        refuses an envelope for, are reported rather than skipped silently.
+        """
+        try:
+            if (track_type or "track") != "track":
+                raise ValueError(
+                    "Return and master tracks have no clips, and Live's API "
+                    "exposes no track automation lane, so arrangement "
+                    "automation can only be written on regular tracks")
+            track = self._resolve_track(track_index, "track")
+            param = self._automation_param(
+                track, device_index, parameter_index, chain_path,
+                mixer_target, send_index)
+            pts = self._automation_points(param, points)
+            start, end = pts[0][0], pts[-1][0] + 0.25
+
+            written, refused, covered = [], [], []
+            for i, clip in enumerate(track.arrangement_clips):
+                window = self._arrangement_window(clip, start, end)
+                if window is None:
+                    continue
+                lo, hi, offset = window
+                try:
+                    envelope = self._clip_envelope(clip, param, create=True)
+                except Exception as e:
+                    envelope, reason = None, str(e)
+                else:
+                    reason = "Live returned no envelope for this clip"
+                if envelope is None:
+                    refused.append({"clip_index": i, "name": clip.name, "reason": reason})
+                    continue
+                inserted, error = self._write_envelope(envelope, pts, offset, lo, hi)
+                entry = {"clip_index": i, "name": clip.name, "from": lo, "to": hi,
+                         "inserted_steps": inserted}
+                if error:
+                    entry["error"] = error
+                written.append(entry)
+                if inserted:
+                    covered.append((lo, hi))
+
+            uncovered, cursor = [], start
+            for lo, hi in sorted(covered):
+                if lo > cursor:
+                    uncovered.append([cursor, lo])
+                cursor = max(cursor, hi)
+            if cursor < end:
+                uncovered.append([cursor, end])
+
+            if not covered:
+                raise Exception(
+                    "Nothing written for '%s' between beats %g and %g: %s. Live "
+                    "only accepts arrangement automation inside clips that take "
+                    "an envelope; write it on a Session clip and duplicate that "
+                    "to the Arrangement instead."
+                    % (param.name, start, pts[-1][0],
+                       "; ".join("clip %d: %s" % (r["clip_index"], r["reason"]) for r in refused)
+                       or "no arrangement clip on this track covers that span"))
+            return {
+                "parameter": param.name,
+                "clips": written,
+                "refused": refused,
+                "uncovered": uncovered,
+            }
+        except Exception as e:
+            self.log_message("Error creating arrangement automation: " + str(e))
+            self.log_message(traceback.format_exc())
+            raise
+
+    def _sample_envelope(self, envelope, param, lo, hi, step, offset=0.0,
+                         inclusive=True):
+        rows = []
+        t = lo
+        while t < hi + (1e-9 if inclusive else -1e-9):
+            v = float(envelope.value_at_time(t - offset))
+            rows.append([round(t, 4), round(v, 6), self._param_display(param, v)])
+            t += step
+        return rows
+
+    def _get_automation(self, track_index, clip_index=None, device_index=None,
+                        parameter_index=None, chain_path=None, mixer_target=None,
+                        send_index=None, track_type="track", start=None,
+                        end=None, step=1.0, max_points=256):
+        """Read a parameter's automation back as [time, value, display] rows.
+
+        With clip_index, samples that Session clip's envelope (clip beats).
+        Without, samples the envelopes of the arrangement clips (song
+        beats). automation_state says whether the parameter has track
+        automation Live will play (or the user has overridden), which is
+        readable even where the envelope itself isn't.
+        """
+        try:
+            track = self._resolve_track(track_index, track_type)
+            param = self._automation_param(
+                track, device_index, parameter_index, chain_path,
+                mixer_target, send_index)
+            state = int(getattr(param, "automation_state", 0) or 0)
+            result = {
+                "parameter": param.name,
+                "value": float(param.value),
+                "display": self._param_display(param),
+                "automation_state": self._AUTOMATION_STATES.get(state, state),
+            }
+            if (track_type or "track") != "track":
+                return result
+            step = max(float(step or 1.0), 1.0 / 64)
+
+            def stepped(lo, hi):
+                # Widen the step so a long span stays within max_points.
+                return max(step, (hi - lo) / float(max(1, int(max_points) - 1)))
+
+            if clip_index is not None:
+                if clip_index < 0 or clip_index >= len(track.clip_slots):
+                    raise IndexError("Clip index out of range")
+                slot = track.clip_slots[clip_index]
+                if not slot.has_clip:
+                    raise Exception("No clip in that slot")
+                clip = slot.clip
+                envelope = clip.automation_envelope(param)
+                result["envelope"] = envelope is not None
+                if envelope is not None:
+                    lo = float(clip.loop_start) if start is None else float(start)
+                    hi = float(clip.loop_end) if end is None else float(end)
+                    result["points"] = self._sample_envelope(
+                        envelope, param, lo, hi, stepped(lo, hi))
+                return result
+
+            clips = []
+            lo_all = float("-inf") if start is None else float(start)
+            hi_all = float("inf") if end is None else float(end)
+            for i, clip in enumerate(track.arrangement_clips):
+                window = self._arrangement_window(clip, lo_all, hi_all)
+                if window is None:
+                    continue
+                lo, hi, offset = window
+                entry = {"clip_index": i, "name": clip.name, "from": lo, "to": hi}
+                try:
+                    envelope = clip.automation_envelope(param)
+                except Exception as e:
+                    envelope, entry["error"] = None, str(e)
+                entry["envelope"] = envelope is not None
+                if envelope is not None:
+                    # A clip's end belongs to whatever follows it; a
+                    # requested end is included.
+                    entry["points"] = self._sample_envelope(
+                        envelope, param, lo, hi, stepped(lo, hi), offset,
+                        inclusive=hi == hi_all)
+                clips.append(entry)
+            result["clips"] = clips
+            return result
+        except Exception as e:
+            self.log_message("Error reading automation: " + str(e))
+            self.log_message(traceback.format_exc())
+            raise
+
+    # ── Device sidechain ──────────────────────────────────────────────────────
+
+    # Compressor exposes these (LOM CompressorDevice). Gate and Auto Filter
+    # aren't documented, so check the device rather than its class name.
+    _SIDECHAIN_ATTRS = ("available_input_routing_types", "input_routing_type")
+
+    def _sidechain_device(self, track_index, device_index, track_type="track",
+                          chain_path=None):
+        track = self._resolve_track(track_index, track_type)
+        device = self._resolve_device(track, device_index, chain_path)
+        if not all(hasattr(device, a) for a in self._SIDECHAIN_ATTRS):
+            raise ValueError(
+                "'%s' (%s) exposes no sidechain routing to Remote Scripts; "
+                "routing attributes on it: %s"
+                % (device.name, getattr(device, "class_name", "?"),
+                   [a for a in dir(device) if "rout" in a.lower()] or "none"))
+        return device
+
+    def _sidechain_toggle(self, device):
+        """The device's "S/C On" parameter, if it has one."""
+        for param in device.parameters:
+            if str(param.name).strip().lower() == "s/c on":
+                return param
+        return None
+
+    def _sidechain_state(self, device):
+        state = {
+            "device_name": device.name,
+            "source": device.input_routing_type.display_name,
+            "available_sources": [
+                t.display_name for t in device.available_input_routing_types],
+        }
+        try:
+            state["channel"] = device.input_routing_channel.display_name
+            state["available_channels"] = [
+                c.display_name for c in device.available_input_routing_channels]
+        except Exception:
+            pass
+        toggle = self._sidechain_toggle(device)
+        if toggle is not None:
+            state["enabled"] = float(toggle.value) > float(toggle.min)
+        return state
+
+    def _get_device_sidechain(self, track_index, device_index, track_type="track",
+                              chain_path=None):
+        try:
+            device = self._sidechain_device(
+                track_index, device_index, track_type, chain_path)
+            return self._sidechain_state(device)
+        except Exception as e:
+            self.log_message("Error reading device sidechain: " + str(e))
+            raise
+
+    def _match_track_source(self, options, name):
+        """Pick the routing type for a track by its name.
+
+        Live lists tracks as "6-Kick" in some places and "Kick" in others,
+        so prefer an exact match, then a "<number>-<name>" match, before
+        falling back to substring matching.
+        """
+        options = list(options)
+        wanted = name.strip().lower()
+        for opt in options:
+            if opt.display_name.strip().lower() == wanted:
+                return opt
+        for opt in options:
+            label = opt.display_name.strip().lower()
+            prefix, _, rest = label.partition("-")
+            if prefix.isdigit() and rest == wanted:
+                return opt
+        return self._match_routing_option(options, name, "source")
+
+    def _set_device_sidechain(self, track_index, device_index, source=None,
+                              source_track_index=None, source_track_type="track",
+                              channel_name=None, enable=True, track_type="track",
+                              chain_path=None):
+        """Route a device's sidechain input and switch the sidechain on.
+
+        source is a routing type name as get_device_sidechain lists it
+        ("6-Kick", "No Input"); source_track_index picks a track (or a
+        return with source_track_type="return") by its current name
+        instead. channel_name picks the tap point ("Post FX", "Pre FX").
+        enable sets the device's "S/C On" switch when it has one.
+        """
+        try:
+            device = self._sidechain_device(
+                track_index, device_index, track_type, chain_path)
+            if source_track_index is not None:
+                source_track = self._resolve_track(
+                    int(source_track_index), source_track_type)
+                match = self._match_track_source(
+                    device.available_input_routing_types, source_track.name)
+                device.input_routing_type = match
+            elif source:
+                match = self._match_routing_option(
+                    device.available_input_routing_types, source, "source")
+                device.input_routing_type = match
+            if channel_name:
+                channel = self._match_routing_option(
+                    device.available_input_routing_channels, channel_name, "channel")
+                device.input_routing_channel = channel
+            if enable is not None:
+                toggle = self._sidechain_toggle(device)
+                if toggle is not None:
+                    toggle.value = float(toggle.max if enable else toggle.min)
+            return self._sidechain_state(device)
+        except Exception as e:
+            self.log_message("Error setting device sidechain: " + str(e))
             self.log_message(traceback.format_exc())
             raise
 

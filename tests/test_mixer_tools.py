@@ -127,3 +127,55 @@ def test_long_running_commands_keep_their_socket_timeout(command):
 
     assert conn.send_command(command, {}) == {"results": []}
     assert min(sock.timeouts) >= 60
+
+
+# ------------------------------------------------------------- 1.20 tools
+
+@pytest.mark.parametrize("kwargs", [
+    {"mixer_target": "send B"},
+    {"device_index": 0, "parameter_index": 1, "chain_path": [1, 0]},
+    {"device_index": 0, "parameter_index": 1, "display_points": True},
+])
+def test_clip_automation_refuses_targets_an_old_script_would_misplace(fake_conn, kwargs):
+    """A 1.19 script ignores mixer_target and chain_path, so the envelope
+    would land on device 0's parameter 0 (or the rack) instead."""
+    load_script(["create_automation"])
+    conn = fake_conn()
+    points = [{"time": 0, "value": 0.0}, {"time": 4, "value": 1.0}]
+    if kwargs.pop("display_points", False):
+        points = [{"time": 0, "display": "200 Hz"}, {"time": 4, "display": "2 kHz"}]
+
+    out = call(server.create_clip_automation, None, track_index=0, clip_index=0,
+               points=points, **kwargs)
+
+    assert "missing capability" in out
+    assert conn.sent == []
+
+
+def test_clip_automation_sends_a_mixer_send_target(fake_conn):
+    load_script(["create_automation", "automation_targets"])
+    conn = fake_conn({"inserted_steps": 17, "parameter": "B"})
+    points = [{"time": 0, "display": "-inf dB"}, {"time": 4, "display": "-6 dB"}]
+
+    call(server.create_clip_automation, None, track_index=3, clip_index=1,
+         points=points, mixer_target="Send B")
+
+    assert conn.sent == [("create_automation", {
+        "mixer_target": "send", "send_index": 1, "track_index": 3, "clip_index": 1,
+        "points": points})]
+
+
+def test_set_device_sidechain_sends_the_source_track(fake_conn):
+    load_script(["set_device_sidechain"])
+    conn = fake_conn({"device_name": "Compressor", "source": "6-Kick",
+                      "channel": "Post FX", "enabled": True,
+                      "available_sources": ["No Input", "6-Kick"]})
+
+    out = call(server.set_device_sidechain, None, track_index=1, device_index=0,
+               source_track=0, source_track_type="return", channel="Post FX")
+
+    assert conn.sent == [("set_device_sidechain", {
+        "track_index": 1, "device_index": 0, "enable": True,
+        "source_track_index": 0, "source_track_type": "return",
+        "channel_name": "Post FX"})]
+    assert out.startswith("Compressor sidechain: 6-Kick / Post FX (on)")

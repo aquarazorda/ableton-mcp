@@ -1,6 +1,6 @@
 # AbletonMCP capability map
 
-Living audit of what this Remote Script (`__init__.py`, currently v1.19.0)
+Living audit of what this Remote Script (`__init__.py`, currently v1.20.0)
 can and can't do. Started 2026-09-19 after a session of live-testing,
 patching, and root-causing real bugs against Live 12.4.6 — not a spec, a
 record of what was actually verified working, kept honest about the
@@ -182,6 +182,47 @@ assumptions below are the parts to check first after a restart:
 - **Routing channels:** `channel_name` on `set_track_routing`.
 - Removed the dispatch for `get_browser_categories` / `get_browser_items`,
   whose handlers never existed.
+
+### v1.20.0 — unit-tested against fakes, not yet run in Live
+
+Closes the gaps 1.19 left open in `docs/mcp-gap-report.md`. Tests are in
+`tests/test_automation_loop_sidechain.py` (fake song) and
+`tests/test_mixer_tools.py` (tool layer). Check these first after a restart:
+
+- **Device sidechain** (`get_device_sidechain` / `set_device_sidechain`):
+  `input_routing_type` / `input_routing_channel` and their `available_*`
+  lists on the device, plus its `S/C On` parameter. Live's LOM docs list
+  these only on `CompressorDevice`. Gate and Auto Filter (`AutoFilter2` in
+  Live 12) have an `S/C On` parameter but no documented routing class, so
+  the script checks the device for the attributes and, when they're
+  missing, errors with the routing-named attributes it does have. The first
+  real call on each device type tells us which way it goes.
+- **Automation targets:** `create_automation` takes `mixer_target`
+  (`volume` / `panning` / `send` + `send_index`) and `chain_path`, and
+  points can give a `display` string instead of a raw value. A clip
+  envelope can only target its own track's parameters. `clear` now uses
+  `Clip.clear_envelope(param)`; the old code called `clear_envelope()` on
+  the envelope, which likely never existed. The last point now gets its own
+  step, so a ramp reaches its final value.
+- **Arrangement automation** (`create_arrangement_automation`): Live's
+  Python API has no handle on a track's arrangement automation lane, so
+  this writes the envelopes of the arrangement clips under the span, with
+  song time mapped to clip time through `start_time` and `start_marker`.
+  A looped clip takes only its first pass. Spans with no clip, and clips
+  that refuse an envelope, are reported. A third-party note says
+  `automation_envelope` returns None for arrangement clips and that only
+  clips which already have an envelope accept writes. If that holds,
+  expect this to work mainly on clips duplicated from Session clips that
+  carry envelopes. Return and master tracks have no clips and are refused.
+- **Read-back** (`get_automation`): samples `AutomationEnvelope.value_at_time`
+  on a Session clip or across arrangement clips, as `[time, value, display]`
+  rows (at most 256). It also reports `DeviceParameter.automation_state`
+  (`none` / `playing` / `overridden`), the only signal for track-lane
+  automation, and readable on returns and master too.
+- **Clip loop** (`set_clip_loop`): `loop_start`, `loop_end`, `length`,
+  `looping` on Session clips. `Clip.length` is read-only, so `length` moves
+  `loop_end`. Start and end are written in whichever order keeps
+  start < end at every step.
 
 ## Genuinely inconclusive — needs a clean re-test
 

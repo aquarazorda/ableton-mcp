@@ -149,6 +149,7 @@ class AbletonConnection:
             "create_automation", "update_notes", "remove_notes_range",
             "set_clip_launch_settings", "set_clip_groove", "create_scene",
             "delete_scene", "fire_scene", "undo", "redo",
+            "set_clip_loop", "create_arrangement_automation", "set_device_sidechain",
         ]
 
         # Commands whose work on Live's main thread can take noticeably longer
@@ -1958,8 +1959,8 @@ def set_track_routing(
     Route a track's input or output, e.g. feed a track from another track.
 
     Names match the options get_track_routing lists (exact, then substring,
-    case-insensitive). Device sidechain inputs (Compressor, Gate) are not
-    reachable yet; use routing to build a resampling or ghost-trigger track.
+    case-insensitive). For a device's sidechain input (Compressor ducking
+    to the kick), use set_device_sidechain.
 
     Parameters:
     - track_index: Track index within its track_type
@@ -1986,6 +1987,121 @@ def set_track_routing(
     except Exception as e:
         logger.error(f"Error setting track routing: {str(e)}")
         return f"Error setting track routing: {str(e)}"
+
+
+def _device_target(track_index: int, device_index: int, track_type: str,
+                   chain_path) -> Dict[str, Any]:
+    params: Dict[str, Any] = {"track_index": track_index, "device_index": device_index}
+    if track_type != "track":
+        params["track_type"] = track_type
+    if chain_path:
+        params["chain_path"] = chain_path
+    return params
+
+
+def _sidechain_summary(result: Dict[str, Any]) -> str:
+    line = f"{result.get('device_name')} sidechain: {result.get('source')}"
+    if result.get("channel"):
+        line += f" / {result['channel']}"
+    if "enabled" in result:
+        line += f" ({'on' if result['enabled'] else 'off'})"
+    sources = ", ".join(result.get("available_sources", []))
+    return f"{line}\nSources: {sources}"
+
+
+@mcp.tool()
+@telemetry_tool("get_device_sidechain")
+@trajectory_tool("get_device_sidechain", modifying=False)
+def get_device_sidechain(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    track_type: str = "track",
+    chain_path: List[int] | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Read a device's sidechain source and the sources it can take.
+
+    Works on devices that expose sidechain routing to Remote Scripts
+    (Compressor; Gate and Auto Filter where Live exposes it). Other devices
+    return an error naming what the device does expose.
+
+    Parameters:
+    - track_index: Track index within its track_type
+    - device_index: Index into the track's device chain
+    - track_type: "track" (default), "return" or "master"
+    - chain_path: [chain_index, device_index, ...] pairs to reach a device inside a rack
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        missing = _missing_features(track_type, chain_path)
+        if missing:
+            return missing
+        result = _send("get_device_sidechain",
+                       _device_target(track_index, device_index, track_type, chain_path))
+        return result if isinstance(result, str) else _sidechain_summary(result)
+    except Exception as e:
+        logger.error(f"Error reading device sidechain: {str(e)}")
+        return f"Error reading device sidechain: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("set_device_sidechain")
+@trajectory_tool("set_device_sidechain")
+def set_device_sidechain(
+    ctx: Context,
+    track_index: int,
+    device_index: int,
+    source_track: int | None = None,
+    source_track_type: str = "track",
+    source: str = "",
+    channel: str = "",
+    enable: bool = True,
+    track_type: str = "track",
+    chain_path: List[int] | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Feed a Compressor, Gate or Auto Filter's sidechain from another track.
+
+    The classic duck: set_device_sidechain(track_index=<bass>,
+    device_index=<its Compressor>, source_track=<kick>). Also switches the
+    device's sidechain ("S/C On") on, unless enable is False.
+
+    Parameters:
+    - track_index: Track that holds the device, within its track_type
+    - device_index: Index into the track's device chain
+    - source_track: Index of the track to listen to (matched by its name)
+    - source_track_type: "track" (default) or "return" for source_track
+    - source: Or a source name as get_device_sidechain lists it, e.g. "6-Kick", "No Input"
+    - channel: Tap point within the source, e.g. "Post FX", "Pre FX", "Post Mixer"
+    - enable: Turn the sidechain on (True, default) or off (False)
+    - track_type: "track" (default), "return" or "master" for the device's track
+    - chain_path: [chain_index, device_index, ...] pairs to reach a device inside a rack
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        if source_track_type not in ("track", "return"):
+            return "source_track_type must be 'track' or 'return'"
+        missing = _missing_features(track_type, chain_path)
+        if missing:
+            return missing
+        params = _device_target(track_index, device_index, track_type, chain_path)
+        params["enable"] = enable
+        if source_track is not None:
+            params["source_track_index"] = source_track
+            if source_track_type != "track":
+                params["source_track_type"] = source_track_type
+        elif source:
+            params["source"] = source
+        if channel:
+            params["channel_name"] = channel
+        result = _send("set_device_sidechain", params)
+        return result if isinstance(result, str) else _sidechain_summary(result)
+    except Exception as e:
+        logger.error(f"Error setting device sidechain: {str(e)}")
+        return f"Error setting device sidechain: {str(e)}"
 
 
 @mcp.tool()
@@ -2184,6 +2300,60 @@ def redo(ctx: Context, user_prompt: str = "") -> str:
         return f"Error redoing: {str(e)}"
 
 
+def _automation_target(device_index: int | None, parameter_index: int | None,
+                       mixer_target: str = "", chain_path=None):
+    """Turn a tool's target arguments into script params.
+
+    Returns (params, capabilities_needed), or an error string. mixer_target
+    is "volume", "pan", or "send A" / "send 0" (letter or index).
+    """
+    params: Dict[str, Any] = {}
+    needed = []
+    target = (mixer_target or "").strip().lower()
+    if target:
+        needed.append("automation_targets")
+        if target in ("volume", "vol"):
+            params["mixer_target"] = "volume"
+        elif target in ("pan", "panning"):
+            params["mixer_target"] = "panning"
+        elif target.startswith("send"):
+            key = target[4:].strip(" :_-")
+            if not key:
+                return "mixer_target 'send' needs a return letter or index, e.g. 'send A'"
+            params["mixer_target"] = "send"
+            params["send_index"] = _send_index(key)
+        else:
+            return f"Unknown mixer_target '{mixer_target}' — use volume, pan or 'send A'"
+    elif device_index is None or parameter_index is None:
+        return "Pass device_index and parameter_index, or mixer_target"
+    else:
+        params["device_index"] = device_index
+        params["parameter_index"] = parameter_index
+        if chain_path:
+            needed.append("chain_path")
+            params["chain_path"] = chain_path
+    return params, needed
+
+
+def _require_all(names) -> str | None:
+    from .script_handshake import require_capability
+
+    for name in names:
+        missing = require_capability(name)
+        if missing:
+            return missing
+    return None
+
+
+def _automation_where(params: Dict[str, Any]) -> str:
+    if params.get("mixer_target") == "send":
+        return f"send {chr(ord('A') + params['send_index'])}"
+    if params.get("mixer_target"):
+        return params["mixer_target"]
+    path = f" chain_path {params['chain_path']}" if params.get("chain_path") else ""
+    return f"device {params['device_index']}{path} parameter {params['parameter_index']}"
+
+
 @mcp.tool()
 @telemetry_tool("create_clip_automation")
 @trajectory_tool("create_clip_automation")
@@ -2191,38 +2361,224 @@ def create_clip_automation(
     ctx: Context,
     track_index: int,
     clip_index: int,
-    device_index: int,
-    parameter_index: int,
-    points: List[Dict[str, float]],
+    points: List[Dict[str, Any]],
+    device_index: int | None = None,
+    parameter_index: int | None = None,
+    mixer_target: str = "",
+    chain_path: List[int] | None = None,
+    clear: bool = True,
     user_prompt: str = "",
 ) -> str:
     """
-    Write a clip envelope for a device parameter in a Session clip.
+    Write a clip envelope in a Session clip, for a device or mixer parameter.
 
     The envelope loops with the clip, which suits filter sweeps, delay
     throws and slow movement across a long loop. Ramps between points are
-    written as 1/16-note steps. Applies to top-level devices on regular
-    tracks only.
+    written as 1/16-note steps. Target a device parameter with
+    device_index + parameter_index (chain_path for a device inside a rack),
+    or the track's own fader, pan or send with mixer_target.
 
     Parameters:
-    - track_index: Track that owns the clip and the device
+    - track_index: Track that owns the clip
     - clip_index: Session clip slot
-    - device_index: Device on the track
-    - parameter_index: Parameter on that device (see get_device_parameters)
-    - points: At least 2 points [{"time": beats_from_clip_start, "value": raw_value}],
-      sorted by time; values in the parameter's raw min..max range
+    - points: At least 2 points, each {"time": beats_from_clip_start} plus
+      either "value" (raw, in the parameter's min..max) or "display"
+      (Live's own string, e.g. "-12 dB", "800 Hz", "25L")
+    - device_index / parameter_index: Device parameter to automate (see get_device_parameters)
+    - mixer_target: "volume", "pan", or "send A" / "send 0" instead of a device parameter
+    - chain_path: [chain_index, device_index, ...] pairs to reach a device inside a rack
+    - clear: Remove this parameter's existing envelope in the clip first (default True)
     - user_prompt: The original user prompt that led to this tool call (for telemetry)
     """
     try:
-        result = _send("create_automation", {
-            "track_index": track_index, "clip_index": clip_index,
-            "device_index": device_index, "parameter_index": parameter_index,
-            "points": points,
-        })
+        target = _automation_target(device_index, parameter_index, mixer_target, chain_path)
+        if isinstance(target, str):
+            return target
+        params, needed = target
+        if any(p.get("display") is not None for p in points) or not clear:
+            needed.append("automation_targets")
+        missing = _require_all(needed)
+        if missing:
+            return missing
+        params.update({"track_index": track_index, "clip_index": clip_index, "points": points})
+        if not clear:
+            params["clear"] = False
+        result = _send("create_automation", params)
         return result if isinstance(result, str) else _compact_json(result)
     except Exception as e:
         logger.error(f"Error creating automation: {str(e)}")
         return f"Error creating automation: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("create_arrangement_automation")
+@trajectory_tool("create_arrangement_automation")
+def create_arrangement_automation(
+    ctx: Context,
+    track_index: int,
+    points: List[Dict[str, Any]],
+    device_index: int | None = None,
+    parameter_index: int | None = None,
+    mixer_target: str = "",
+    chain_path: List[int] | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Write automation across a span of the Arrangement, in song beats.
+
+    Live's API gives no access to a track's own automation lane, so this
+    writes the envelopes of the arrangement clips under the span (the
+    Arrangement plays them as automation). Parts of the span with no clip,
+    and clips Live refuses an envelope for, are reported. Return and master
+    tracks have no clips, so they can't be automated this way. If nothing
+    can be written, put the automation on a Session clip with
+    create_clip_automation and duplicate_to_arrangement it instead.
+
+    Parameters:
+    - track_index: Regular track (not a return or the master)
+    - points: At least 2 points, each {"time": song_beat} plus "value" (raw)
+      or "display" (e.g. "-12 dB", "800 Hz")
+    - device_index / parameter_index: Device parameter to automate
+    - mixer_target: "volume", "pan", or "send A" / "send 0" instead of a device parameter
+    - chain_path: [chain_index, device_index, ...] pairs to reach a device inside a rack
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        target = _automation_target(device_index, parameter_index, mixer_target, chain_path)
+        if isinstance(target, str):
+            return target
+        params, needed = target
+        missing = _require_all(needed)
+        if missing:
+            return missing
+        params.update({"track_index": track_index, "points": points})
+        result = _send("create_arrangement_automation", params)
+        if isinstance(result, str):
+            return result
+        rows = [f"{result.get('parameter')} ({_automation_where(params)}) on track {track_index}:"]
+        for c in result.get("clips", []):
+            line = (f"  clip {c['clip_index']} {c['name']}: beats {c['from']:g}–{c['to']:g}, "
+                    f"{c['inserted_steps']} steps")
+            if c.get("error"):
+                line += f" (stopped: {c['error']})"
+            rows.append(line)
+        for r in result.get("refused", []):
+            rows.append(f"  clip {r['clip_index']} {r['name']}: refused — {r['reason']}")
+        for lo, hi in result.get("uncovered", []):
+            rows.append(f"  beats {lo:g}–{hi:g}: no clip, nothing written")
+        return "\n".join(rows)
+    except Exception as e:
+        logger.error(f"Error creating arrangement automation: {str(e)}")
+        return f"Error creating arrangement automation: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("get_automation")
+@trajectory_tool("get_automation", modifying=False)
+def get_automation(
+    ctx: Context,
+    track_index: int,
+    device_index: int | None = None,
+    parameter_index: int | None = None,
+    mixer_target: str = "",
+    chain_path: List[int] | None = None,
+    clip_index: int | None = None,
+    track_type: str = "track",
+    start: float | None = None,
+    end: float | None = None,
+    step: float = 1.0,
+    user_prompt: str = "",
+) -> str:
+    """
+    Read a parameter's automation back as sampled [time, value, display] rows.
+
+    With clip_index, samples that Session clip's envelope (clip beats).
+    Without it, samples the envelopes of the track's arrangement clips
+    (song beats). automation_state reports whether the parameter has track
+    automation ("playing", or "overridden" after a manual change), which is
+    readable on returns and master too even though their envelopes aren't.
+
+    Parameters:
+    - track_index: Track index within its track_type
+    - device_index / parameter_index: Device parameter to read
+    - mixer_target: "volume", "pan", or "send A" / "send 0" instead of a device parameter
+    - chain_path: [chain_index, device_index, ...] pairs to reach a device inside a rack
+    - clip_index: Session clip slot; omit to read the Arrangement
+    - track_type: "track" (default), "return" or "master"
+    - start / end: Span to sample, in beats (default: the whole clip)
+    - step: Beats between samples (default 1; widened to keep at most 256 rows)
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        target = _automation_target(device_index, parameter_index, mixer_target, chain_path)
+        if isinstance(target, str):
+            return target
+        params, needed = target
+        missing = _missing_features(track_type, extra=needed)
+        if missing:
+            return missing
+        params.update({"track_index": track_index, "step": step})
+        if track_type != "track":
+            params["track_type"] = track_type
+        for key, value in (("clip_index", clip_index), ("start", start), ("end", end)):
+            if value is not None:
+                params[key] = value
+        result = _send("get_automation", params)
+        return result if isinstance(result, str) else _compact_json(result)
+    except Exception as e:
+        logger.error(f"Error reading automation: {str(e)}")
+        return f"Error reading automation: {str(e)}"
+
+
+@mcp.tool()
+@telemetry_tool("set_clip_loop")
+@trajectory_tool("set_clip_loop")
+def set_clip_loop(
+    ctx: Context,
+    track_index: int,
+    clip_index: int,
+    loop_start: float | None = None,
+    loop_end: float | None = None,
+    length: float | None = None,
+    looping: bool | None = None,
+    user_prompt: str = "",
+) -> str:
+    """
+    Set a Session clip's loop start, loop end or length, and looping on/off.
+
+    Only the arguments you pass change. length sets loop_end to
+    loop_start + length (pass loop_end or length, not both). For an
+    unlooped clip these move the clip's start and end. Times are in beats
+    (seconds for unwarped audio). Lengthening a MIDI clip's loop doesn't
+    copy notes into the new space.
+
+    Parameters:
+    - track_index: Track that owns the clip
+    - clip_index: Session clip slot
+    - loop_start: Loop start in beats
+    - loop_end: Loop end in beats
+    - length: Loop length in beats, measured from loop_start
+    - looping: Turn looping on or off
+    - user_prompt: The original user prompt that led to this tool call (for telemetry)
+    """
+    try:
+        changes = {k: v for k, v in (
+            ("loop_start", loop_start), ("loop_end", loop_end),
+            ("length", length), ("looping", looping),
+        ) if v is not None}
+        if not changes:
+            return "Nothing to change: pass loop_start, loop_end, length or looping"
+        result = _send("set_clip_loop", {
+            "track_index": track_index, "clip_index": clip_index, **changes,
+        })
+        if isinstance(result, str):
+            return result
+        state = "looped" if result.get("looping") else "not looped"
+        return (f"Clip {track_index}/{clip_index}: loop {result.get('loop_start'):g}–"
+                f"{result.get('loop_end'):g} ({result.get('length'):g} beats, {state})")
+    except Exception as e:
+        logger.error(f"Error setting clip loop: {str(e)}")
+        return f"Error setting clip loop: {str(e)}"
 
 
 @mcp.tool()

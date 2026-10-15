@@ -7,9 +7,9 @@ These are field notes from one production session: a minimal dub techno groove a
 
 **Headline:** the Remote Script advertises 49 commands, and 31 of them have no MCP tool. The rest of the Live-side work is mostly done; the tool layer is missing.
 
-## Status (v1.19.0, branch docs/mcp-gap-report)
+## Status (v1.20.0)
 
-Unit-tested against a fake Live song; **not yet run in Live**. Install the script with `ableton-mcp-install-script` and restart Live fully before relying on it.
+1.19 and 1.20 are unit-tested against a fake Live song; **neither has run in Live yet**. Install the script with `ableton-mcp-install-script` and restart Live fully before relying on it.
 
 | # | Gap | Status |
 |---|---|---|
@@ -17,14 +17,14 @@ Unit-tested against a fake Live song; **not yet run in Live**. Install the scrip
 | 1 | Mixer | `get_mixer`, `set_mixer` (volume_db, pan, sends_db, mute, solo, arm) |
 | 2 | Return / master | `track_type` on device, mixer, routing and load tools |
 | 3 | Display values | `display` + `value_items` on parameters; `display_value` on `set_device_parameter` |
-| 4 | Routing / sidechain | `get_track_routing` / `set_track_routing` with channels. **Device sidechain inputs are still not reachable.** |
+| 4 | Routing / sidechain | `get_track_routing` / `set_track_routing` with channels. 1.20: `get_device_sidechain` / `set_device_sidechain` (source track, tap channel, S/C On). Compressor is documented in the LOM. Gate and Auto Filter depend on whether Live exposes the same routing attributes on them, and the script reports it when it doesn't. |
 | 5 | Rack devices | `chain_path` on get / set / delete / move |
 | 6 | Drum pad notes | `drum_pads` on drum racks |
 | 7 | Payload size | Chains summarized by default, `name_filter`, compact rows, no indent |
 | 8 | Browser | `search_browser`, and paging on `get_browser_items_at_path` |
-| 9 | Automation | `create_clip_automation` (Session clips, top-level devices). **Still missing: arrangement automation, mixer-parameter targets, read-back.** |
+| 9 | Automation | `create_clip_automation` with mixer targets (volume, pan, sends), `chain_path` and display-string points. 1.20: `create_arrangement_automation` writes the envelopes of the arrangement clips under a span, and `get_automation` reads envelopes back plus `automation_state`. **Live's API has no track automation lane, so returns and master, and arrangement spans with no clip, still can't be automated.** |
 | 10 | Device management | `delete_device`, `move_device`, load `position`; the load result reports the device index |
-| 11 | Scenes / clips | `fire_scene`, `create_scene`, `delete_scene`, `set_clip_launch_settings`, grooves. **Still missing: clip loop/length, arrangement trim/split.** |
+| 11 | Scenes / clips | `fire_scene`, `create_scene`, `delete_scene`, `set_clip_launch_settings`, grooves. 1.20: `set_clip_loop` (loop_start, loop_end, length, looping). **Still missing: arrangement trim/split.** |
 | 12 | Note editing | `update_notes`, `remove_notes` |
 | 13 | Metering | `get_meters` (peaks/averages on Live's meter scale). **Still missing: render, LUFS.** |
 | 14 | Indices | Track creation and load report indices |
