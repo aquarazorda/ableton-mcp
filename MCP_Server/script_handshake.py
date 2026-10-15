@@ -34,6 +34,30 @@ _LEGACY_CAPABILITIES = frozenset({
 })
 
 
+def _parse_version(value: Any) -> tuple[int, ...] | None:
+    """Parse a dotted numeric version ("1.18.0"); None if not numeric."""
+    parts = str(value or "").strip().split(".")
+    if not all(part.isdigit() for part in parts):
+        return None
+    return tuple(int(part) for part in parts)
+
+
+def version_compatible(script_version: Any) -> bool:
+    """True when the loaded script is the expected version or newer.
+
+    A newer Remote Script only adds commands, so it still serves everything
+    this package calls. Non-numeric versions must match exactly.
+    """
+    loaded = _parse_version(script_version)
+    expected = _parse_version(EXPECTED_REMOTE_SCRIPT_VERSION)
+    if loaded is None or expected is None:
+        return str(script_version or "") == EXPECTED_REMOTE_SCRIPT_VERSION
+    width = max(len(loaded), len(expected))
+    loaded += (0,) * (width - len(loaded))
+    expected += (0,) * (width - len(expected))
+    return loaded >= expected
+
+
 def get_cached_script_info() -> dict[str, Any] | None:
     with _lock:
         return dict(_script_info) if _script_info else None
@@ -53,7 +77,7 @@ def script_version_ok() -> bool:
     info = get_cached_script_info()
     if not info:
         return False
-    return str(info.get("script_version") or "") == EXPECTED_REMOTE_SCRIPT_VERSION
+    return version_compatible(info.get("script_version"))
 
 
 def handshake(send_command) -> dict[str, Any]:
@@ -71,9 +95,7 @@ def handshake(send_command) -> dict[str, Any]:
         if isinstance(result, dict):
             info.update(result)
             info["expected_version"] = EXPECTED_REMOTE_SCRIPT_VERSION
-            info["up_to_date"] = (
-                str(result.get("script_version") or "") == EXPECTED_REMOTE_SCRIPT_VERSION
-            )
+            info["up_to_date"] = version_compatible(result.get("script_version"))
     except Exception as e:
         msg = str(e)
         info["error"] = msg
