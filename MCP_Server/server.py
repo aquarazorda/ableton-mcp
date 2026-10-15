@@ -62,10 +62,14 @@ class AbletonConnection:
                     self.sock = None
 
     def receive_full_response(self, sock, buffer_size=8192):
-        """Receive the complete response, potentially in multiple chunks"""
+        """Receive the complete response, potentially in multiple chunks.
+
+        Uses whatever timeout the caller set on ``sock``: long-running
+        commands (audio import, meter sampling, browser indexing) need more
+        than the default, so this must not reset it.
+        """
         chunks = []
-        sock.settimeout(15.0)  # Increased timeout for operations that might take longer
-        
+
         try:
             while True:
                 try:
@@ -404,6 +408,10 @@ def _compact_device(device: Dict[str, Any]) -> Dict[str, Any]:
     out = {k: v for k, v in device.items() if k not in ("parameters", "chains")}
     params = device.get("parameters")
     if params is not None:
+        disabled = [p.get("index") for p in params if p.get("is_enabled") is False]
+        if disabled:
+            # Macro-controlled: setting these directly fails.
+            out["macro_controlled"] = disabled
         rows = []
         for p in params:
             row = [p.get("index"), p.get("name"), round(float(p.get("value", 0.0)), 4),

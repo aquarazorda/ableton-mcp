@@ -161,6 +161,21 @@ def test_unknown_track_type_is_an_error_not_a_regular_track():
 
 # ------------------------------------------------------------- rack paths
 
+def test_macro_controlled_parameter_explains_why_it_cannot_be_set():
+    """Live's own error, 'the parameter is disabled', gave no hint that a
+    rack macro owns the parameter."""
+    feedback = FakeParam("Feedback")
+    feedback.is_enabled = False
+    live = make_live(FakeSong([FakeTrack("Stab", [FakeDevice("Echo", [feedback])])]))
+
+    reply = live._process_command({"type": "set_device_parameter", "params": {
+        "track_index": 0, "device_index": 0, "parameter_index": 0, "value": 0.5}})
+
+    assert reply["status"] == "error"
+    assert "macro" in reply["message"]
+    assert feedback.value == 0.0
+
+
 def test_chain_path_sets_a_device_inside_a_rack():
     echo = FakeDevice("Echo", [FakeParam("Feedback")])
     rack = FakeDevice("Chord Dub Keys", [FakeParam("Macro 1")],
@@ -301,6 +316,10 @@ def test_search_browser_ranks_name_matches_and_finds_presets_under_devices():
         ]),
         FakeBrowserItem("Dub Chord.adg", loadable=True, uri="u:dub-chord"),
     ])
+    # The same preset file appears under a second root with another URI prefix.
+    sounds.children[0].children.append(
+        FakeBrowserItem("Deep Chord.adg", loadable=True, uri="u:Synths#Wavetable:FileId_9"))
+    sounds.children[0].children[0].uri = "u:Sounds#Dub:FileId_9"
     browser = FakeSearchBrowser(instruments=FakeBrowserItem("Instruments", [drift]),
                                 sounds=sounds)
     live = make_live(FakeSong(), application=FakeApplication(browser=browser))
@@ -309,7 +328,7 @@ def test_search_browser_ranks_name_matches_and_finds_presets_under_devices():
     bass = run(live, "search_browser", query="sub dub")
 
     # Exact name first; a match only through the folder path comes after.
-    assert [r["uri"] for r in chord["results"]] == ["u:dub-chord", "u:chord"]
+    assert [r["uri"] for r in chord["results"]] == ["u:dub-chord", "u:Sounds#Dub:FileId_9"]
     assert [r["uri"] for r in bass["results"]] == ["u:drift-dub"]
     assert all(r["is_loadable"] for r in chord["results"])
 

@@ -95,3 +95,35 @@ def test_set_mixer_sends_levels_as_display_values(fake_conn, script_1_19):
                              "display_value": "-12.5 dB"}),
         ("set_track_state", {"track_index": 2, "mute": True}),
     ]
+
+
+class _SlowSocket:
+    """Replies only after the caller's timeout has been checked."""
+
+    def __init__(self):
+        self.timeouts = []
+
+    def sendall(self, data):
+        pass
+
+    def settimeout(self, value):
+        self.timeouts.append(value)
+
+    def recv(self, size):
+        if self.timeouts[-1] < 60:
+            import socket
+            raise socket.timeout()
+        return b'{"status": "success", "result": {"results": []}}'
+
+
+@pytest.mark.parametrize("command", ["search_browser", "create_audio_clip"])
+def test_long_running_commands_keep_their_socket_timeout(command):
+    """receive_full_response reset every timeout to 15 s, so building the
+    browser index (or importing a long sample) failed with 'No data
+    received' while Live was still working."""
+    sock = _SlowSocket()
+    conn = server.AbletonConnection(host="localhost", port=0)
+    conn.sock = sock
+
+    assert conn.send_command(command, {}) == {"results": []}
+    assert min(sock.timeouts) >= 60

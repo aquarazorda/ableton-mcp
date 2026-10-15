@@ -3744,6 +3744,13 @@ class AbletonMCP(ControlSurface):
             value = self._value_for_display(param, display_value)
         if value is None:
             raise ValueError("Pass value or display_value")
+        if not getattr(param, "is_enabled", True):
+            # Live refuses with "the parameter is disabled", which reads like
+            # a bug. It almost always means a rack macro controls it.
+            raise ValueError(
+                "'%s' is controlled by a rack macro or modulation and can't be "
+                "set directly; set the macro that controls it instead"
+                % param.name)
         lo, hi = float(param.min), float(param.max)
         old = float(param.value)
         old_display = self._param_display(param)
@@ -4149,12 +4156,23 @@ class AbletonMCP(ControlSurface):
                     rank = 3
                 scored.append((rank, len(entry["path"]), entry))
         scored.sort(key=lambda r: (r[0], r[1]))
+        # The same preset file is listed under several roots (Sounds,
+        # Instruments/Wavetable, Instruments/Instrument Rack); keep the
+        # best-ranked copy of each.
+        unique, seen = [], set()
+        for _, _, entry in scored:
+            uri = entry["uri"] or entry["path"]
+            key = uri[uri.rfind("FileId_"):] if "FileId_" in uri else uri
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(entry)
         limit = max(1, min(int(limit or 20), 200))
         return {
             "query": query,
             "roots": roots,
-            "total_matches": len(scored),
-            "results": [e for _, _, e in scored[:limit]],
+            "total_matches": len(unique),
+            "results": unique[:limit],
             "truncated_roots": truncated_roots,
         }
 
