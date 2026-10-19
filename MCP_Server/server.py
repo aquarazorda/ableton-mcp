@@ -2025,9 +2025,9 @@ def get_device_sidechain(
     """
     Read a device's sidechain source and the sources it can take.
 
-    Works on devices that expose sidechain routing to Remote Scripts
-    (Compressor; Gate and Auto Filter where Live exposes it). Other devices
-    return an error naming what the device does expose.
+    Compressor only: as of Live 12.4 it is the one device that exposes its
+    sidechain routing to Remote Scripts. Gate, Glue Compressor and Auto
+    Filter return an error; route those by hand in Live.
 
     Parameters:
     - track_index: Track index within its track_type
@@ -2065,7 +2065,10 @@ def set_device_sidechain(
     user_prompt: str = "",
 ) -> str:
     """
-    Feed a Compressor, Gate or Auto Filter's sidechain from another track.
+    Feed a Compressor's sidechain from another track.
+
+    Compressor only (Live 12.4); route Gate, Glue Compressor and Auto
+    Filter sidechains by hand in Live.
 
     The classic duck: set_device_sidechain(track_index=<bass>,
     device_index=<its Compressor>, source_track=<kick>). Also switches the

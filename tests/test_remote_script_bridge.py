@@ -48,6 +48,9 @@ def _load_script_module(fresh=False):
         def show_message(self, *args, **kwargs):
             pass
 
+        def disconnect(self):
+            pass
+
     control_surface_mod.ControlSurface = _StubControlSurface
     framework.ControlSurface = control_surface_mod
     sys.modules.setdefault("_Framework", framework)
@@ -70,6 +73,7 @@ def make_instance(script_module, application=None):
     inst.application = lambda: application
     inst.log_message = lambda *a, **k: None
     inst.show_message = lambda *a, **k: None
+    inst.client_sockets = []
     return inst
 
 
@@ -102,6 +106,7 @@ class FakeClient(object):
         self._chunks = list(chunks)
         self.sent = []
         self.closed = False
+        self.shut_down = False
 
     def settimeout(self, _timeout):
         pass
@@ -111,6 +116,9 @@ class FakeClient(object):
 
     def sendall(self, data):
         self.sent.append(data)
+
+    def shutdown(self, _how):
+        self.shut_down = True
 
     def close(self):
         self.closed = True
@@ -234,3 +242,44 @@ def test_browser_tree_caps_a_huge_folder_and_flags_it(script_module):
 
     assert len(category["children"]) == 64
     assert category["has_more"] is True
+
+
+# ------------------------------------------------------------- set reload
+
+def test_disconnect_closes_client_connections(script_module):
+    """Live disconnects the old instance when a set is (re)loaded. Its client
+    handlers block in recv(), so unless their sockets are closed the MCP
+    server keeps talking to the old instance and its dead Song."""
+    inst = make_instance(script_module)
+    inst.running = True
+    inst.server = None
+    inst.server_thread = None
+    inst._teardown_passive_listeners = lambda: None
+    client = FakeClient([])
+    inst.client_sockets = [client]
+
+    inst.disconnect()
+
+    assert client.shut_down and client.closed
+    assert inst.client_sockets == []
+
+
+def test_command_arriving_after_disconnect_is_not_run(script_module):
+    inst = make_instance(script_module)
+    inst.running = True
+    ran = []
+    inst._process_command = lambda command: ran.append(command)
+
+    class _ArrivesAfterDisconnect(FakeClient):
+        def recv(self, size):
+            inst.running = False  # disconnect() ran while recv() blocked
+            return FakeClient.recv(self, size)
+
+    client = _ArrivesAfterDisconnect([b'{"type": "get_session_info", "params": {}}'])
+    inst.client_sockets = [client]
+    inst._handle_client(client)
+
+    assert ran == []
+    assert client.sent == []
+    assert client.closed
+    assert inst.client_sockets == []

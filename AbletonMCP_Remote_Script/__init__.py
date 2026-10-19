@@ -125,6 +125,8 @@ class AbletonMCP(ControlSurface):
         # Socket server for communication
         self.server = None
         self.client_threads = []
+        # Open client sockets, closed on disconnect (see there)
+        self.client_sockets = []
         self.server_thread = None
         self.running = False
         
@@ -175,11 +177,21 @@ class AbletonMCP(ControlSurface):
         if self.server_thread and self.server_thread.is_alive():
             self.server_thread.join(1.0)
             
-        # Clean up any client threads
-        for client_thread in self.client_threads[:]:
-            if client_thread.is_alive():
-                # We don't join them as they might be stuck
-                self.log_message("Client thread still alive during disconnect")
+        # Close client connections. Their handlers sit in a blocking recv(),
+        # so without this they outlive the instance: when Live reloads the
+        # set, the MCP server's next command lands on this old instance and
+        # fails on its dead Song. Closing makes the server see EOF and
+        # reconnect to the new instance.
+        for client in self.client_sockets[:]:
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                client.close()
+            except Exception:
+                pass
+        self.client_sockets = []
         
         ControlSurface.disconnect(self)
         self.log_message("AbletonMCP disconnected")
@@ -215,6 +227,7 @@ class AbletonMCP(ControlSurface):
                     client, address = self.server.accept()
                     self.log_message("Connection accepted from " + str(address))
                     self.show_message("AbletonMCP: Client connected")
+                    self.client_sockets.append(client)
                     
                     # Handle client in a separate thread
                     client_thread = threading.Thread(
@@ -265,6 +278,11 @@ class AbletonMCP(ControlSurface):
                         self.log_message("Client disconnected")
                         break
 
+                    if not self.running:
+                        # Disconnected while blocked in recv(): this
+                        # instance's Song is gone, so don't run anything.
+                        break
+
                     buffer += data
 
                     if len(buffer) > MAX_REQUEST_BYTES:
@@ -313,6 +331,8 @@ class AbletonMCP(ControlSurface):
                 client.close()
             except:
                 pass
+            if client in self.client_sockets:
+                self.client_sockets.remove(client)
             self.log_message("Client handler stopped")
     
     def _process_command(self, command):
